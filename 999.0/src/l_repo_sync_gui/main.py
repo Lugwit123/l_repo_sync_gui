@@ -36,6 +36,7 @@ IGNORE_LINES = [
 ]
 
 SKIP_DIRS = {"repo_tools"}
+PREVIEW_MAX_LINES = 300
 
 
 def _find_rez_source_root() -> Path:
@@ -229,23 +230,67 @@ class RepoSyncWindow(QMainWindow):
         branch = (msg or "").strip().splitlines()[-1] if ok and msg.strip() else "main"
         return branch or "main"
 
+    def _clip_lines(self, lines: list[str], limit: int = PREVIEW_MAX_LINES) -> list[str]:
+        clipped = [x for x in lines if x is not None]
+        if len(clipped) > limit:
+            return clipped[:limit] + [f"...(共 {len(clipped)} 行，仅显示前 {limit} 行)"]
+        return clipped
+
     def _confirm_action(self, title: str, pkg_name: str, lines: list[str], fallback: str) -> bool:
         preview = [x for x in lines if x.strip()]
         if not preview:
             preview = [fallback]
-        limit = 120
-        if len(preview) > limit:
-            preview = preview[:limit] + [f"...(共 {len(lines)} 条，仅显示前 {limit} 条)"]
-        text = f"{pkg_name} 将执行以下文件操作：\n\n" + "\n".join(preview)
-        ans = QMessageBox.question(self, title, text, QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
-        return ans == QMessageBox.Yes
+        clipped = self._clip_lines(preview)
 
-    def _preview_upload_files(self, pkg_dir: Path) -> list[str]:
+        summary = []
+        for line in clipped:
+            if line.startswith(" A ") or line.startswith("A "):
+                summary.append(line)
+            elif line.startswith(" M ") or line.startswith("M "):
+                summary.append(line)
+            elif line.startswith(" D ") or line.startswith("D "):
+                summary.append(line)
+        summary = summary[:25]
+        summary_text = "\n".join(summary) if summary else "(见详细变更)"
+
+        msg_box = QMessageBox(self)
+        msg_box.setWindowTitle(title)
+        msg_box.setIcon(QMessageBox.Question)
+        msg_box.setText(f"{pkg_name} 将执行文件同步。\n\n关键文件变更（含删除）:\n{summary_text}")
+        msg_box.setInformativeText("点击“显示详情”可查看每个文件改动(diff)。是否继续？")
+        msg_box.setDetailedText("\n".join(clipped))
+        msg_box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+        msg_box.setDefaultButton(QMessageBox.No)
+        return msg_box.exec() == QMessageBox.Yes
+
+    def _status_lines(self, pkg_dir: Path) -> tuple[bool, list[str]]:
         ok, msg = self._run(["git", "status", "--porcelain"], cwd=pkg_dir)
         if not ok:
-            return [f"[无法预览] {msg}"]
+            return False, [f"[无法获取 status] {msg}"]
         lines = [line for line in (msg or "").splitlines() if line.strip()]
-        return lines
+        return True, lines
+
+    def _diff_lines(self, pkg_dir: Path, diff_cmd: list[str], title: str) -> list[str]:
+        ok, msg = self._run(diff_cmd, cwd=pkg_dir)
+        if not ok:
+            return [f"[{title}] 获取失败: {msg}"]
+        body = [line for line in (msg or "").splitlines()]
+        if not body:
+            return [f"[{title}] (无差异)"]
+        return [f"[{title}]"] + body
+
+    def _preview_upload_files(self, pkg_dir: Path) -> list[str]:
+        ok_status, status_lines = self._status_lines(pkg_dir)
+        if not ok_status:
+            return status_lines
+        out = ["[上传预览] 本地将覆盖远端（push）", "", "[文件列表: git status --porcelain]"]
+        out.extend(status_lines or ["(无本地文件变化)"])
+        out.append("")
+        # 显示 tracked 文件变更，便于确认“每个文件改了什么”。
+        out.extend(self._diff_lines(pkg_dir, ["git", "diff", "--patch"], "工作区修改 diff"))
+        out.append("")
+        out.extend(self._diff_lines(pkg_dir, ["git", "diff", "--cached", "--patch"], "已暂存修改 diff"))
+        return out
 
     def _preview_download_files(self, pkg_dir: Path) -> list[str]:
         self._run(["git", "fetch", "--all", "--prune"], cwd=pkg_dir)
@@ -261,7 +306,17 @@ class RepoSyncWindow(QMainWindow):
         if not ok_diff:
             return [f"[无法预览] {msg_diff}"]
         lines = [line for line in (msg_diff or "").splitlines() if line.strip()]
-        return lines
+        out = [f"[下载预览] 远端 {upstream_ref} -> 本地 HEAD", "", "[文件列表: name-status]"]
+        out.extend(lines or ["(无远端文件变化)"])
+        out.append("")
+        out.extend(
+            self._diff_lines(
+                pkg_dir,
+                ["git", "diff", "--patch", f"HEAD..{upstream_ref}"],
+                "远端将带来的修改 diff",
+            )
+        )
+        return out
 
     def upload_one(self, pkg_dir: Path):
         owner = self.owner_edit.text().strip() or "Lugwit123"
