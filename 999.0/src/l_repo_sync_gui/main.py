@@ -1,6 +1,7 @@
 import datetime
 import json
 import os
+import shutil
 import subprocess
 import sys
 import threading
@@ -12,6 +13,8 @@ from PySide6.QtCore import QObject, Qt, Signal
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
+    QDialog,
+    QFrame,
     QHBoxLayout,
     QInputDialog,
     QLabel,
@@ -20,6 +23,8 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QScrollArea,
+    QSplitter,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
     QTextEdit,
@@ -61,15 +66,26 @@ class _AiBridge(QObject):
     finished = Signal(bool, str)
 
 
+class _AiStreamBridge(QObject):
+    status = Signal(str)
+    chunk = Signal(str)
+    finished = Signal(bool, str)
+
+
 class RepoSyncWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.rez_source = _find_rez_source_root()
         self.setWindowTitle("Rez Package Repo Sync")
-        self.resize(1100, 760)
+        self.resize(1280, 820)
+        self.setMinimumSize(1100, 700)
 
         self.owner_edit = QLineEdit("Lugwit123")
         self.owner_edit.setPlaceholderText("GitHub owner, e.g. Lugwit123")
+        self.git_path_edit = QLineEdit()
+        self.git_path_edit.setPlaceholderText("git.exe path (optional, auto-detect if empty)")
+        self.gh_path_edit = QLineEdit()
+        self.gh_path_edit.setPlaceholderText("gh.exe path (optional, auto-detect if empty)")
         self.force_push_checkbox = QCheckBox("强制本地覆盖远端（--force-with-lease）")
         self.force_push_checkbox.setToolTip("仅上传时生效。会用本地提交覆盖远端分支，请谨慎使用。")
         self.api_key_edit = QLineEdit(
@@ -81,27 +97,55 @@ class RepoSyncWindow(QMainWindow):
         self.model_edit.setPlaceholderText("SiliconFlow model")
         self.ai_prompt_edit = QTextEdit()
         self.ai_prompt_edit.setPlaceholderText("输入问题，例如：请总结当前上传预览的风险点")
-        self.ai_prompt_edit.setFixedHeight(72)
+        self.ai_prompt_edit.setMinimumHeight(120)
         self.ai_answer_edit = QTextEdit()
         self.ai_answer_edit.setReadOnly(True)
-        self.ai_answer_edit.setFixedHeight(140)
+        self.ai_answer_edit.setMinimumHeight(220)
         self.ai_ask_btn: QPushButton | None = None
         self.ai_bridge = _AiBridge()
         self.ai_bridge.finished.connect(self._on_ai_result)
 
         self.log_edit = QTextEdit()
         self.log_edit.setReadOnly(True)
+        self.log_edit.setMinimumHeight(180)
         self.row_buttons = []
 
+        self._apply_style()
         self._build_ui()
         self.refresh_packages()
+
+    def _apply_style(self):
+        self.setStyleSheet(
+            """
+            QMainWindow { background: #1f1f22; }
+            QLabel { font-size: 13px; }
+            QPushButton { min-height: 28px; padding: 1px 8px; }
+            QLineEdit, QTextEdit {
+                font-size: 13px;
+                border: 1px solid #3b3b3f;
+                border-radius: 4px;
+                padding: 6px;
+            }
+            """
+        )
+        self._row_button_style = "QPushButton { min-height: 20px; max-height: 20px; padding: 0px 4px; font-size: 12px; }"
 
     def _build_ui(self):
         root = QWidget(self)
         main_layout = QVBoxLayout(root)
+        main_layout.setContentsMargins(12, 10, 12, 12)
+        main_layout.setSpacing(10)
+
+        top_bar = QFrame()
+        top_bar.setFrameShape(QFrame.StyledPanel)
+        top_lay = QVBoxLayout(top_bar)
+        top_lay.setContentsMargins(10, 8, 10, 8)
+        top_lay.setSpacing(8)
 
         owner_line = QHBoxLayout()
+        owner_line.setSpacing(8)
         owner_line.addWidget(QLabel("GitHub Owner:"))
+        self.owner_edit.setMinimumWidth(240)
         owner_line.addWidget(self.owner_edit, 1)
 
         btn_refresh = QPushButton("刷新包列表")
@@ -119,29 +163,59 @@ class RepoSyncWindow(QMainWindow):
         btn_restart = QPushButton("重启")
         btn_restart.clicked.connect(self.restart_self)
         owner_line.addWidget(btn_restart)
-        main_layout.addLayout(owner_line)
-        main_layout.addWidget(self.force_push_checkbox)
+        top_lay.addLayout(owner_line)
 
-        body_layout = QHBoxLayout()
+        gh_line = QHBoxLayout()
+        gh_line.setSpacing(8)
+        gh_line.addWidget(QLabel("git.exe:"))
+        gh_line.addWidget(self.git_path_edit, 1)
+        gh_line.addWidget(QLabel("gh.exe:"))
+        gh_line.addWidget(self.gh_path_edit, 1)
+        top_lay.addLayout(gh_line)
 
-        left_panel = QWidget()
-        left_layout = QVBoxLayout(left_panel)
+        top_lay.addWidget(self.force_push_checkbox)
+        main_layout.addWidget(top_bar)
+
+        body_splitter = QSplitter(Qt.Horizontal)
+        body_splitter.setChildrenCollapsible(False)
+
+        left_panel = QSplitter(Qt.Vertical)
+        left_panel.setChildrenCollapsible(False)
+
+        pkg_panel = QWidget()
+        left_layout = QVBoxLayout(pkg_panel)
         left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(6)
+        left_layout.addWidget(QLabel("包列表:"))
         self.list_area = QScrollArea()
         self.list_area.setWidgetResizable(True)
         self.list_widget = QWidget()
         self.list_layout = QVBoxLayout(self.list_widget)
+        self.list_layout.setContentsMargins(0, 0, 0, 0)
+        self.list_layout.setSpacing(1)
         self.list_layout.setAlignment(Qt.AlignTop)
         self.list_area.setWidget(self.list_widget)
-        left_layout.addWidget(self.list_area, 3)
-        left_layout.addWidget(QLabel("日志输出:"))
-        left_layout.addWidget(self.log_edit, 2)
-        body_layout.addWidget(left_panel, 3)
+        left_layout.addWidget(self.list_area, 1)
+
+        log_panel = QWidget()
+        log_layout = QVBoxLayout(log_panel)
+        log_layout.setContentsMargins(0, 0, 0, 0)
+        log_layout.setSpacing(6)
+        log_layout.addWidget(QLabel("日志输出:"))
+        log_layout.addWidget(self.log_edit, 1)
+
+        left_panel.addWidget(pkg_panel)
+        left_panel.addWidget(log_panel)
+        left_panel.setStretchFactor(0, 3)
+        left_panel.setStretchFactor(1, 2)
+        left_panel.setSizes([430, 260])
 
         right_panel = QWidget()
         right_layout = QVBoxLayout(right_panel)
         right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(8)
         ai_line = QHBoxLayout()
+        ai_line.setSpacing(8)
         ai_line.addWidget(QLabel("硅基 Key:"))
         ai_line.addWidget(self.api_key_edit, 2)
         ai_line.addWidget(QLabel("模型:"))
@@ -154,11 +228,78 @@ class RepoSyncWindow(QMainWindow):
         right_layout.addWidget(self.ai_prompt_edit)
         right_layout.addWidget(QLabel("AI回复:"))
         right_layout.addWidget(self.ai_answer_edit, 1)
-        body_layout.addWidget(right_panel, 2)
+        body_splitter.addWidget(left_panel)
+        body_splitter.addWidget(right_panel)
+        body_splitter.setStretchFactor(0, 3)
+        body_splitter.setStretchFactor(1, 2)
+        body_splitter.setSizes([760, 500])
 
-        main_layout.addLayout(body_layout, 1)
+        main_layout.addWidget(body_splitter, 1)
 
         self.setCentralWidget(root)
+        self._init_gh_path()
+
+    def _init_gh_path(self):
+        """初始化 git/gh 路径输入框：优先环境变量，其次自动探测。"""
+        env_git = (os.environ.get("GIT_EXE_PATH") or "").strip()
+        if env_git:
+            self.git_path_edit.setText(env_git)
+        else:
+            auto_git = self._resolve_git_executable(from_manual=False)
+            if auto_git:
+                self.git_path_edit.setText(auto_git)
+
+        env_gh = (os.environ.get("GH_EXE_PATH") or "").strip()
+        if env_gh:
+            self.gh_path_edit.setText(env_gh)
+            return
+        auto = self._resolve_gh_executable(from_manual=False)
+        if auto:
+            self.gh_path_edit.setText(auto)
+
+    def _resolve_git_executable(self, from_manual: bool = True) -> str | None:
+        """返回可执行 git 路径（优先用户输入）。"""
+        manual = (self.git_path_edit.text() or "").strip() if from_manual else ""
+        if manual:
+            if os.path.isfile(manual):
+                return manual
+            return None
+
+        which_git = shutil.which("git")
+        if which_git and os.path.isfile(which_git):
+            return which_git
+
+        default_paths = [
+            r"C:\Program Files\Git\cmd\git.exe",
+            r"C:\Program Files\Git\bin\git.exe",
+            r"C:\Program Files (x86)\Git\cmd\git.exe",
+            r"C:\Program Files (x86)\Git\bin\git.exe",
+        ]
+        for p in default_paths:
+            if os.path.isfile(p):
+                return p
+        return None
+
+    def _resolve_gh_executable(self, from_manual: bool = True) -> str | None:
+        """返回可执行 gh 路径（优先用户输入）。"""
+        manual = (self.gh_path_edit.text() or "").strip() if from_manual else ""
+        if manual:
+            if os.path.isfile(manual):
+                return manual
+            return None
+
+        which_gh = shutil.which("gh")
+        if which_gh and os.path.isfile(which_gh):
+            return which_gh
+
+        default_paths = [
+            r"C:\Program Files\GitHub CLI\gh.exe",
+            r"C:\Program Files (x86)\GitHub CLI\gh.exe",
+        ]
+        for p in default_paths:
+            if os.path.isfile(p):
+                return p
+        return None
 
     def _set_busy(self, busy: bool):
         for btn in self.row_buttons:
@@ -172,18 +313,44 @@ class RepoSyncWindow(QMainWindow):
         QApplication.processEvents()
 
     def _run(self, cmd: list[str], cwd: Path | None = None) -> tuple[bool, str]:
-        self._log(f"$ {' '.join(cmd)}")
+        if not cmd:
+            return False, "empty command"
+
+        effective_cmd = list(cmd)
+        if cmd[0] == "git":
+            git_exe = self._resolve_git_executable()
+            if not git_exe:
+                return False, "git.exe not found"
+            effective_cmd[0] = git_exe
+        elif cmd[0] == "gh":
+            gh_exe = self._resolve_gh_executable()
+            if not gh_exe:
+                return False, "gh.exe not found"
+            effective_cmd[0] = gh_exe
+
+        self._log(f"$ {' '.join(effective_cmd)}")
         try:
             result = subprocess.run(
-                cmd,
+                effective_cmd,
                 cwd=str(cwd) if cwd else None,
                 capture_output=True,
-                text=True,
+                text=False,
             )
         except Exception as exc:
             return False, str(exc)
-        out = (result.stdout or "").strip()
-        err = (result.stderr or "").strip()
+
+        def _decode_output(data: bytes | None) -> str:
+            if not data:
+                return ""
+            for enc in ("utf-8", "gbk", sys.getdefaultencoding()):
+                try:
+                    return data.decode(enc)
+                except Exception:
+                    continue
+            return data.decode("utf-8", errors="replace")
+
+        out = _decode_output(result.stdout).strip()
+        err = _decode_output(result.stderr).strip()
         merged = "\n".join(x for x in [out, err] if x)
         if result.returncode != 0:
             return False, merged or f"exit code={result.returncode}"
@@ -193,10 +360,28 @@ class RepoSyncWindow(QMainWindow):
         ok_git, msg_git = self._run(["git", "--version"])
         ok_gh, msg_gh = self._run(["gh", "--version"])
         if not ok_git:
-            QMessageBox.warning(self, "缺少工具", f"找不到 git:\n{msg_git}")
+            QMessageBox.warning(
+                self,
+                "缺少工具",
+                (
+                    "找不到 git。\n"
+                    "请在顶部 git.exe 输入框设置路径，"
+                    "例如: C:\\Program Files\\Git\\cmd\\git.exe\n\n"
+                    f"详细信息:\n{msg_git}"
+                ),
+            )
             return False
         if not ok_gh:
-            QMessageBox.warning(self, "缺少工具", f"找不到 gh:\n{msg_gh}")
+            QMessageBox.warning(
+                self,
+                "缺少工具",
+                (
+                    "找不到 gh。\n"
+                    "请在顶部 gh.exe 输入框设置路径，"
+                    "例如: C:\\Program Files\\GitHub CLI\\gh.exe\n\n"
+                    f"详细信息:\n{msg_gh}"
+                ),
+            )
             return False
         return True
 
@@ -228,23 +413,37 @@ class RepoSyncWindow(QMainWindow):
         for pkg_name, pkg_dir in self._package_entries():
             row = QWidget()
             row_lay = QHBoxLayout(row)
-            row_lay.setContentsMargins(4, 4, 4, 4)
+            row_lay.setContentsMargins(1, 0, 1, 0)
+            row_lay.setSpacing(4)
 
             label = QLabel(pkg_name)
-            label.setMinimumWidth(220)
+            label.setStyleSheet("font-size: 12px;")
+            label.setMinimumWidth(135)
             row_lay.addWidget(label)
 
             btn_up = QPushButton("上传")
+            btn_up.setStyleSheet(self._row_button_style)
+            btn_up.setMinimumHeight(20)
+            btn_up.setMaximumWidth(72)
             btn_up.clicked.connect(lambda _=False, p=pkg_dir: self.upload_one(p))
             row_lay.addWidget(btn_up)
             self.row_buttons.append(btn_up)
 
             btn_down = QPushButton("下载")
+            btn_down.setStyleSheet(self._row_button_style)
+            btn_down.setMinimumHeight(20)
+            btn_down.setMaximumWidth(72)
             btn_down.clicked.connect(lambda _=False, p=pkg_dir: self.download_one(p))
             row_lay.addWidget(btn_down)
             self.row_buttons.append(btn_down)
 
             self.list_layout.addWidget(row)
+            sep = QFrame()
+            sep.setFrameShape(QFrame.HLine)
+            sep.setFrameShadow(QFrame.Plain)
+            sep.setFixedHeight(2)
+            sep.setStyleSheet("color: #5a5a62; margin: 0px; padding: 0px;")
+            self.list_layout.addWidget(sep)
 
         self._log(f"已加载 {self.list_layout.count()} 个包。")
 
@@ -295,7 +494,9 @@ class RepoSyncWindow(QMainWindow):
             return clipped[:limit] + [f"...(共 {len(clipped)} 行，仅显示前 {limit} 行)"]
         return clipped
 
-    def _confirm_action(self, title: str, pkg_name: str, lines: list[str], fallback: str) -> bool:
+    def _confirm_action(
+        self, title: str, pkg_name: str, lines: list[str], fallback: str, enable_ai: bool = False
+    ) -> tuple[bool, str | None]:
         preview = [x for x in lines if x.strip()]
         if not preview:
             preview = [fallback]
@@ -312,15 +513,271 @@ class RepoSyncWindow(QMainWindow):
         summary = summary[:25]
         summary_text = "\n".join(summary) if summary else "(见详细变更)"
 
-        msg_box = QMessageBox(self)
-        msg_box.setWindowTitle(title)
-        msg_box.setIcon(QMessageBox.Question)
-        msg_box.setText(f"{pkg_name} 将执行文件同步。\n\n关键文件变更（含删除）:\n{summary_text}")
-        msg_box.setInformativeText("点击“显示详情”可查看每个文件改动(diff)。是否继续？")
-        msg_box.setDetailedText("\n".join(clipped))
-        msg_box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
-        msg_box.setDefaultButton(QMessageBox.No)
-        return msg_box.exec() == QMessageBox.Yes
+        dlg = QDialog(self)
+        dlg.setWindowTitle(title)
+        dlg.resize(980, 720)
+        dlg.setMinimumSize(860, 620)
+        layout = QVBoxLayout(dlg)
+
+        info = QLabel(
+            f"{pkg_name} 将执行文件同步。\n\n"
+            f"关键文件变更（新增/修改/删除）:\n{summary_text}\n\n"
+            "下方按标签页显示完整预览（含完整路径与 diff）。是否继续？"
+        )
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        tabs = QTabWidget(dlg)
+        tabs.setMinimumHeight(500)
+
+        overview = QTextEdit(dlg)
+        overview.setReadOnly(True)
+        overview.setPlainText("\n".join(clipped))
+        tabs.addTab(overview, "总览")
+
+        file_blocks = self._extract_file_diff_blocks(clipped)
+        for file_name, block in file_blocks:
+            editor = QTextEdit(dlg)
+            editor.setReadOnly(True)
+            editor.setPlainText(block)
+            tabs.addTab(editor, self._safe_tab_name(file_name))
+
+        main_content_splitter = QSplitter(Qt.Horizontal, dlg)
+        main_content_splitter.setChildrenCollapsible(False)
+        main_content_splitter.addWidget(tabs)
+
+        ai_detail_edit: QTextEdit | None = None
+        ai_use_as_commit = None
+        if enable_ai:
+            ai_panel = QWidget(dlg)
+            ai_panel_lay = QVBoxLayout(ai_panel)
+            ai_panel_lay.setContentsMargins(0, 0, 0, 0)
+            ai_panel_lay.setSpacing(8)
+
+            ai_bar = QHBoxLayout()
+            ai_bar.setSpacing(8)
+            ai_btn = QPushButton("AI查看修改详情")
+            ai_status = QLabel("可生成详细分析，并可直接用作提交注释。支持流式输出。")
+            ai_status.setWordWrap(True)
+            ai_bar.addWidget(ai_btn)
+            ai_bar.addWidget(ai_status, 1)
+            ai_panel_lay.addLayout(ai_bar)
+
+            ai_input_edit = QTextEdit(dlg)
+            ai_input_edit.setReadOnly(True)
+            ai_input_edit.setPlaceholderText("这里显示发送给 AI 的输入详情（prompt）。")
+            ai_input_edit.setMinimumHeight(120)
+            ai_panel_lay.addWidget(ai_input_edit)
+
+            ai_detail_edit = QTextEdit(dlg)
+            ai_detail_edit.setPlaceholderText("点击“AI查看修改详情”后将在此显示分析结果。")
+            ai_detail_edit.setMinimumHeight(220)
+            ai_panel_lay.addWidget(ai_detail_edit, 1)
+
+            ai_trace_edit = QTextEdit(dlg)
+            ai_trace_edit.setReadOnly(True)
+            ai_trace_edit.setPlaceholderText("实时状态日志")
+            ai_trace_edit.setMinimumHeight(90)
+            ai_panel_lay.addWidget(ai_trace_edit)
+
+            ai_use_as_commit = QCheckBox("提交时使用 AI 详情作为 commit message")
+            ai_use_as_commit.setChecked(True)
+            ai_panel_lay.addWidget(ai_use_as_commit)
+
+            stream_bridge = _AiStreamBridge()
+            current_ai_text = {"text": ""}
+
+            def _append_status(msg: str):
+                ai_trace_edit.append(msg)
+                ai_trace_edit.ensureCursorVisible()
+
+            def _append_chunk(chunk: str):
+                if not chunk:
+                    return
+                current_ai_text["text"] += chunk
+                ai_detail_edit.setPlainText(current_ai_text["text"])
+                cursor = ai_detail_edit.textCursor()
+                cursor.movePosition(cursor.MoveOperation.End)
+                ai_detail_edit.setTextCursor(cursor)
+
+            def _finish_stream(ok: bool, message: str):
+                ai_btn.setEnabled(True)
+                ai_btn.setText("AI查看修改详情")
+                if ok:
+                    if message and not current_ai_text["text"]:
+                        current_ai_text["text"] = message
+                        ai_detail_edit.setPlainText(message)
+                    ai_status.setText("AI 分析完成，可编辑后作为提交注释。")
+                else:
+                    ai_status.setText("AI 分析失败，请检查 Key/模型配置。")
+                    if message:
+                        _append_status(f"[ERROR] {message}")
+
+            stream_bridge.status.connect(_append_status)
+            stream_bridge.chunk.connect(_append_chunk)
+            stream_bridge.finished.connect(_finish_stream)
+
+            def _run_ai_review():
+                ai_btn.setEnabled(False)
+                ai_btn.setText("分析中...")
+                ai_trace_edit.clear()
+                current_ai_text["text"] = ""
+                ai_detail_edit.clear()
+
+                ai_input_lines = self._clip_lines(clipped, limit=1200)
+                prompt = self._build_ai_detailed_review_prompt(pkg_name, "\n".join(ai_input_lines))
+                ai_input_edit.setPlainText(prompt)
+                stream_bridge.status.emit("[INFO] 已构建输入，开始请求 AI（stream）。")
+
+                def _worker():
+                    ok, msg = self._stream_ai_detailed_review(
+                        prompt=prompt,
+                        on_status=lambda s: stream_bridge.status.emit(s),
+                        on_chunk=lambda c: stream_bridge.chunk.emit(c),
+                    )
+                    stream_bridge.finished.emit(ok, msg)
+
+                threading.Thread(target=_worker, daemon=True).start()
+
+            ai_btn.clicked.connect(_run_ai_review)
+            main_content_splitter.addWidget(ai_panel)
+            main_content_splitter.setStretchFactor(0, 3)
+            main_content_splitter.setStretchFactor(1, 2)
+            main_content_splitter.setSizes([640, 420])
+        else:
+            main_content_splitter.setStretchFactor(0, 1)
+
+        layout.addWidget(main_content_splitter, 1)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        btn_yes = QPushButton("Yes")
+        btn_no = QPushButton("No")
+        btn_no.setDefault(True)
+        btn_yes.clicked.connect(dlg.accept)
+        btn_no.clicked.connect(dlg.reject)
+        btn_row.addWidget(btn_yes)
+        btn_row.addWidget(btn_no)
+        layout.addLayout(btn_row)
+        accepted = dlg.exec() == QDialog.Accepted
+        commit_msg_from_ai = None
+        if (
+            accepted
+            and enable_ai
+            and ai_detail_edit is not None
+            and ai_use_as_commit is not None
+            and ai_use_as_commit.isChecked()
+        ):
+            txt = (ai_detail_edit.toPlainText() or "").strip()
+            if txt:
+                commit_msg_from_ai = txt
+        return accepted, commit_msg_from_ai
+
+    @staticmethod
+    def _safe_tab_name(file_name: str, max_len: int = 36) -> str:
+        """标签页名称截断，避免过长影响可读性。"""
+        if len(file_name) <= max_len:
+            return file_name
+        return "..." + file_name[-(max_len - 3) :]
+
+    @staticmethod
+    def _extract_file_diff_blocks(lines: list[str]) -> list[tuple[str, str]]:
+        """从预览文本中提取每个文件的 diff 块，用于标签页展示。"""
+        blocks: list[tuple[str, str]] = []
+        current_name: str | None = None
+        current_lines: list[str] = []
+
+        for line in lines:
+            if line.startswith("diff --git "):
+                if current_name and current_lines:
+                    blocks.append((current_name, "\n".join(current_lines)))
+                current_lines = [line]
+                parts = line.split()
+                if len(parts) >= 4 and parts[2].startswith("a/"):
+                    current_name = parts[2][2:]
+                else:
+                    current_name = f"file_{len(blocks) + 1}"
+                continue
+            if current_name:
+                current_lines.append(line)
+
+        if current_name and current_lines:
+            blocks.append((current_name, "\n".join(current_lines)))
+        return blocks
+
+    def _build_ai_detailed_review_prompt(self, pkg_name: str, preview_text: str) -> str:
+        """构建 AI 详细分析 prompt。"""
+        return (
+            "请基于以下 git 变更预览，输出尽量详细的改动分析，并生成可直接用于 git commit -m 的提交注释。\n"
+            "输出格式要求：\n"
+            "1) 第一行：简洁标题（不超过 50 字）。\n"
+            "2) 空一行后，详细说明改动点、影响范围、风险点、验证建议（每项用短段落）。\n"
+            "3) 内容直接输出纯文本，不要 markdown 代码块。\n\n"
+            f"包名: {pkg_name}\n\n"
+            "变更预览:\n"
+            f"{preview_text}"
+        )
+
+    def _stream_ai_detailed_review(
+        self,
+        prompt: str,
+        on_status,
+        on_chunk,
+    ) -> tuple[bool, str]:
+        """流式请求 AI 详细分析，实时回调输出。"""
+        api_key = self.api_key_edit.text().strip()
+        if not api_key:
+            return False, "未填写 AI Key，无法生成详细分析"
+        model = self.model_edit.text().strip() or DEFAULT_SILICONFLOW_MODEL
+        payload = {
+            "model": model,
+            "stream": True,
+            "messages": [
+                {"role": "system", "content": "你是资深代码审查助手，擅长撰写高质量提交注释。"},
+                {"role": "user", "content": prompt},
+            ],
+        }
+        req = urllib.request.Request(
+            SILICONFLOW_URL,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {api_key}",
+            },
+            method="POST",
+        )
+        try:
+            on_status("[INFO] 请求已发送，等待流式响应...")
+            chunks: list[str] = []
+            with urllib.request.urlopen(req, timeout=90) as resp:
+                for raw in resp:
+                    line = raw.decode("utf-8", errors="replace").strip()
+                    if not line:
+                        continue
+                    if not line.startswith("data:"):
+                        continue
+                    data_str = line[5:].strip()
+                    if data_str == "[DONE]":
+                        on_status("[INFO] 流式输出结束。")
+                        break
+                    try:
+                        packet = json.loads(data_str)
+                    except Exception:
+                        continue
+                    delta = (
+                        packet.get("choices", [{}])[0]
+                        .get("delta", {})
+                        .get("content", "")
+                    )
+                    if delta:
+                        chunks.append(delta)
+                        on_chunk(delta)
+            content = "".join(chunks).strip()
+            if not content:
+                return False, "AI 返回为空"
+            return True, content
+        except Exception as exc:
+            return False, f"AI 详细分析失败: {exc}"
 
     def _status_lines(self, pkg_dir: Path) -> tuple[bool, list[str]]:
         ok, msg = self._run(["git", "status", "--porcelain"], cwd=pkg_dir)
@@ -343,12 +800,36 @@ class RepoSyncWindow(QMainWindow):
         if not ok_status:
             return status_lines
         out = ["[上传预览] 本地将覆盖远端（push）", "", "[文件列表: git status --porcelain]"]
-        out.extend(status_lines or ["(无本地文件变化)"])
+        out.extend(self._format_status_lines_with_full_path(pkg_dir, status_lines) or ["(无本地文件变化)"])
         out.append("")
         # 显示 tracked 文件变更，便于确认“每个文件改了什么”。
         out.extend(self._diff_lines(pkg_dir, ["git", "diff", "--patch"], "工作区修改 diff"))
         out.append("")
         out.extend(self._diff_lines(pkg_dir, ["git", "diff", "--cached", "--patch"], "已暂存修改 diff"))
+        return out
+
+    def _format_status_lines_with_full_path(self, pkg_dir: Path, status_lines: list[str]) -> list[str]:
+        """将 git status --porcelain 输出转换为带完整路径的可读行。"""
+        out: list[str] = []
+        for raw in status_lines:
+            line = raw.rstrip()
+            if not line:
+                continue
+            status = line[:2].strip() or "?"
+            path_part = line[3:] if len(line) > 3 else ""
+
+            if " -> " in path_part:
+                old_rel, new_rel = path_part.split(" -> ", 1)
+                old_abs = str((pkg_dir / old_rel).resolve())
+                new_abs = str((pkg_dir / new_rel).resolve())
+                out.append(f"{status} {old_abs} -> {new_abs}")
+                continue
+
+            rel = path_part
+            if rel.startswith('"') and rel.endswith('"') and len(rel) >= 2:
+                rel = rel[1:-1]
+            abs_path = str((pkg_dir / rel).resolve())
+            out.append(f"{status} {abs_path}")
         return out
 
     def _preview_download_files(self, pkg_dir: Path) -> list[str]:
@@ -391,7 +872,14 @@ class RepoSyncWindow(QMainWindow):
             self._ensure_gitignore(pkg_dir)
             self._ensure_remote(pkg_dir, pkg_name, owner)
             upload_preview = self._preview_upload_files(pkg_dir)
-            if not self._confirm_action("确认上传", pkg_name, upload_preview, "无文件变化（可能仅推送远端分支状态）"):
+            confirmed, ai_commit_message = self._confirm_action(
+                "确认上传",
+                pkg_name,
+                upload_preview,
+                "无文件变化（可能仅推送远端分支状态）",
+                enable_ai=True,
+            )
+            if not confirmed:
                 self._log(f"[info] {pkg_name} 取消上传")
                 return
             branch = self._current_branch(pkg_dir)
@@ -399,19 +887,20 @@ class RepoSyncWindow(QMainWindow):
             self._run(["git", "add", "-A"], cwd=pkg_dir)
             ok, _ = self._run(["git", "diff", "--cached", "--quiet"], cwd=pkg_dir)
             if not ok:
-                ai_commit_msg = self._request_ai_commit_message(pkg_name, pkg_dir)
+                ai_commit_msg = ai_commit_message or self._request_ai_commit_message(pkg_name, pkg_dir)
                 commit_msg = ai_commit_msg
                 if not commit_msg:
-                    commit_msg, accepted = QInputDialog.getMultiLineText(
+                    manual_msg, accepted = QInputDialog.getMultiLineText(
                         self,
                         "手动输入提交注释",
                         f"{pkg_name} 的 AI 注释不可用，请手动输入 commit message:",
                         f"sync {pkg_name}\n\nmanual commit message",
                     )
-                    if not accepted or not commit_msg.strip():
+                    manual_msg = (manual_msg or "").strip()
+                    if not accepted or not manual_msg:
                         self._log(f"[info] {pkg_name} 未提供提交注释，取消上传")
                         return
-                    commit_msg = commit_msg.strip()
+                    commit_msg = manual_msg
                     self._log(f"[info] {pkg_name} 使用手动提交注释")
                 if ai_commit_msg:
                     self._log(f"[ok] {pkg_name} 使用 AI 生成提交注释")
@@ -448,6 +937,17 @@ class RepoSyncWindow(QMainWindow):
                 return
 
             self._log(f"[info] push 失败，尝试 gh repo create: {msg_push}")
+            if not self._resolve_gh_executable():
+                self._log("[ERR] 未找到 gh.exe，无法自动创建远端仓库")
+                QMessageBox.warning(
+                    self,
+                    "上传失败",
+                    (
+                        f"{pkg_name} push 失败，且未找到 gh.exe。\n"
+                        "请在顶部 gh.exe 输入框设置 gh 路径后重试。"
+                    ),
+                )
+                return
             ok_create, msg_create = self._run(
                 [
                     "gh",
@@ -497,7 +997,10 @@ class RepoSyncWindow(QMainWindow):
                 return
 
             download_preview = self._preview_download_files(pkg_dir)
-            if not self._confirm_action("确认下载", pkg_name, download_preview, "无远端文件变化"):
+            confirmed, _ = self._confirm_action(
+                "确认下载", pkg_name, download_preview, "无远端文件变化", enable_ai=False
+            )
+            if not confirmed:
                 self._log(f"[info] {pkg_name} 取消下载")
                 return
             ok_pull, msg_pull = self._run(["git", "pull", "--ff-only"], cwd=pkg_dir)
