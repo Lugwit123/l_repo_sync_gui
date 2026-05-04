@@ -1,3 +1,4 @@
+import argparse
 import datetime
 import json
 import os
@@ -81,10 +82,13 @@ class _AiStreamBridge(QObject):
 
 
 class RepoSyncWindow(QMainWindow):
-    def __init__(self):
+    def __init__(self, launch_mode: str | None = None):
         super().__init__()
         self.rez_source = _find_rez_source_root()
-        self.setWindowTitle("Rez Package Repo Sync")
+        title = "Rez Package Repo Sync"
+        if launch_mode:
+            title = f"{title} - {launch_mode}"
+        self.setWindowTitle(title)
         self.resize(1280, 820)
         self.setMinimumSize(1100, 700)
 
@@ -437,13 +441,19 @@ class RepoSyncWindow(QMainWindow):
             run_env["GH_TOKEN"] = gh_token
             run_env["GITHUB_TOKEN"] = gh_token
         try:
-            result = subprocess.run(
+            proc = subprocess.Popen(
                 effective_cmd,
                 cwd=str(cwd) if cwd else None,
-                capture_output=True,
-                text=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 env=run_env,
             )
+            while True:
+                try:
+                    out_b, err_b = proc.communicate(timeout=0.1)
+                    break
+                except subprocess.TimeoutExpired:
+                    QApplication.processEvents()
         except Exception as exc:
             return False, str(exc)
 
@@ -457,11 +467,11 @@ class RepoSyncWindow(QMainWindow):
                     continue
             return data.decode("utf-8", errors="replace")
 
-        out = _decode_output(result.stdout).strip()
-        err = _decode_output(result.stderr).strip()
+        out = _decode_output(out_b).strip()
+        err = _decode_output(err_b).strip()
         merged = "\n".join(x for x in [out, err] if x)
-        if result.returncode != 0:
-            return False, merged or f"exit code={result.returncode}"
+        if proc.returncode != 0:
+            return False, merged or f"exit code={proc.returncode}"
         return True, merged
 
     def _check_tools(self) -> bool:
@@ -631,6 +641,17 @@ class RepoSyncWindow(QMainWindow):
             return False
         return any(m in low for m in repo_not_found_markers)
 
+    @staticmethod
+    def _is_non_fast_forward_error(push_err: str) -> bool:
+        low = (push_err or "").lower()
+        markers = [
+            "non-fast-forward",
+            "tip of your current branch is behind",
+            "fetch first",
+            "rejected",
+        ]
+        return any(m in low for m in markers)
+
     def _clip_lines(self, lines: list[str], limit: int = PREVIEW_MAX_LINES) -> list[str]:
         clipped = [x for x in lines if x is not None]
         if len(clipped) > limit:
@@ -663,12 +684,18 @@ class RepoSyncWindow(QMainWindow):
         layout = QVBoxLayout(dlg)
 
         info = QLabel(
-            f"{pkg_name} 将执行文件同步。\n\n"
-            f"关键文件变更（新增/修改/删除）:\n{summary_text}\n\n"
-            "下方按标签页显示完整预览（含完整路径与 diff）。是否继续？"
+            f"{pkg_name} 将执行文件同步。"
+            "\n下方按标签页显示完整预览（含完整路径与 diff）。是否继续？"
         )
         info.setWordWrap(True)
         layout.addWidget(info)
+
+        summary_box = QTextEdit(dlg)
+        summary_box.setReadOnly(True)
+        summary_box.setPlainText(f"关键文件变更（新增/修改/删除）:\n{summary_text}")
+        summary_box.setMinimumHeight(120)
+        summary_box.setMaximumHeight(500)
+        layout.addWidget(summary_box)
 
         tabs = QTabWidget(dlg)
         tabs.setMinimumHeight(500)
@@ -1144,6 +1171,40 @@ class RepoSyncWindow(QMainWindow):
                 self._log(f"[ok] {pkg_name} pushed")
                 return
 
+            if not self.force_push_checkbox.isChecked() and self._is_non_fast_forward_error(msg_push):
+                self._log(f"[warn] {pkg_name} push 被远端拒绝，尝试自动 pull --rebase 后重试")
+                ok_pull_rebase, msg_pull_rebase = self._run(
+                    ["git", "pull", "--rebase", "--autostash", "origin", branch], cwd=pkg_dir
+                )
+                if ok_pull_rebase:
+                    self._log(f"[ok] {pkg_name} pull --rebase 成功，开始重试 push")
+                    ok_push_retry, msg_push_retry = self._run(push_cmd, cwd=pkg_dir)
+                    if ok_push_retry:
+                        self._log(f"[ok] {pkg_name} pushed（自动重试成功）")
+                        return
+                    self._log(f"[ERR] {pkg_name} 重试 push 失败: {msg_push_retry}")
+                    QMessageBox.warning(
+                        self,
+                        "上传失败",
+                        (
+                            f"{pkg_name} push 被远端拒绝，已自动 pull --rebase 并重试，但仍失败。\n\n"
+                            f"pull --rebase 输出:\n{msg_pull_rebase}\n\n"
+                            f"push 重试输出:\n{msg_push_retry}"
+                        ),
+                    )
+                    return
+                self._log(f"[ERR] {pkg_name} 自动 pull --rebase 失败: {msg_pull_rebase}")
+                QMessageBox.warning(
+                    self,
+                    "上传失败",
+                    (
+                        f"{pkg_name} push 被远端拒绝（non-fast-forward），自动 pull --rebase 失败。\n"
+                        "请先处理 rebase 冲突或手动同步后再推送。\n\n"
+                        f"详情:\n{msg_pull_rebase}"
+                    ),
+                )
+                return
+
             if not self._should_try_create_repo(msg_push):
                 self._log(f"[ERR] {pkg_name} push 失败（不满足自动建仓条件）: {msg_push}")
                 QMessageBox.warning(
@@ -1434,8 +1495,13 @@ class RepoSyncWindow(QMainWindow):
 
 
 def main():
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--mode", choices=["server", "client"], default="")
+    args, _unknown = parser.parse_known_args()
+    mode_map = {"server": "Server", "client": "Client"}
+
     app = QApplication(sys.argv)
-    win = RepoSyncWindow()
+    win = RepoSyncWindow(mode_map.get(args.mode) or None)
     win.show()
     sys.exit(app.exec())
 
