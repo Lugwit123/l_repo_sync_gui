@@ -14,6 +14,7 @@ from PySide6.QtCore import QObject, Qt, Signal
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
+    QComboBox,
     QDialog,
     QFrame,
     QHBoxLayout,
@@ -51,7 +52,12 @@ IGNORE_LINES = [
 SKIP_DIRS = {"repo_tools"}
 PREVIEW_MAX_LINES = 300
 SILICONFLOW_URL = "https://api.siliconflow.cn/v1/chat/completions"
-DEFAULT_SILICONFLOW_MODEL = "Qwen/Qwen3.6-35B-A3B"
+DEFAULT_SILICONFLOW_MODEL = "Qwen/Qwen2.5-7B-Instruct"
+MODEL_PRESETS = [
+    "Qwen/Qwen2.5-7B-Instruct",
+    "Qwen/Qwen2.5-14B-Instruct",
+    "Pro/zai-org/GLM-4.7",
+]
 DEFAULT_SILICONFLOW_KEY = "sk-gzwtmzfhglvibdbvrttmsuuqsyyjxghxlxzdhubdefmshqoi"
 AUTH_CONFIG_FILE = Path.home() / ".l_repo_sync_gui_auth.json"
 
@@ -98,8 +104,12 @@ class RepoSyncWindow(QMainWindow):
         )
         self.api_key_edit.setEchoMode(QLineEdit.Password)
         self.api_key_edit.setPlaceholderText("SiliconFlow API Key")
-        self.model_edit = QLineEdit(DEFAULT_SILICONFLOW_MODEL)
-        self.model_edit.setPlaceholderText("SiliconFlow model")
+        self.model_edit = QComboBox()
+        self.model_edit.setEditable(True)
+        self.model_edit.addItems(MODEL_PRESETS)
+        self.model_edit.setCurrentText(DEFAULT_SILICONFLOW_MODEL)
+        if self.model_edit.lineEdit():
+            self.model_edit.lineEdit().setPlaceholderText("SiliconFlow model")
         self.ai_prompt_edit = QTextEdit()
         self.ai_prompt_edit.setPlaceholderText("输入问题，例如：请总结当前上传预览的风险点")
         self.ai_prompt_edit.setMinimumHeight(120)
@@ -243,6 +253,9 @@ class RepoSyncWindow(QMainWindow):
         ai_line.addWidget(self.api_key_edit, 2)
         ai_line.addWidget(QLabel("模型:"))
         ai_line.addWidget(self.model_edit, 1)
+        btn_model_test = QPushButton("测试模型连接")
+        btn_model_test.clicked.connect(self._test_model_connection)
+        ai_line.addWidget(btn_model_test)
         self.ai_ask_btn = QPushButton("问AI")
         self.ai_ask_btn.clicked.connect(self.ask_ai)
         ai_line.addWidget(self.ai_ask_btn)
@@ -887,7 +900,7 @@ class RepoSyncWindow(QMainWindow):
         api_key = self.api_key_edit.text().strip()
         if not api_key:
             return False, "未填写 AI Key，无法生成详细分析"
-        model = self.model_edit.text().strip() or DEFAULT_SILICONFLOW_MODEL
+        model = self.model_edit.currentText().strip() or DEFAULT_SILICONFLOW_MODEL
         payload = {
             "model": model,
             "stream": True,
@@ -1244,7 +1257,7 @@ class RepoSyncWindow(QMainWindow):
 
     def ask_ai(self):
         api_key = self.api_key_edit.text().strip()
-        model = self.model_edit.text().strip() or DEFAULT_SILICONFLOW_MODEL
+        model = self.model_edit.currentText().strip() or DEFAULT_SILICONFLOW_MODEL
         user_prompt = self.ai_prompt_edit.toPlainText().strip()
         if not api_key:
             QMessageBox.warning(self, "问AI失败", "请先填写 SiliconFlow API Key。")
@@ -1295,6 +1308,51 @@ class RepoSyncWindow(QMainWindow):
 
         threading.Thread(target=_worker, daemon=True).start()
 
+    def _test_model_connection(self):
+        api_key = self.api_key_edit.text().strip()
+        model = self.model_edit.currentText().strip() or DEFAULT_SILICONFLOW_MODEL
+        if not api_key:
+            QMessageBox.warning(self, "模型测试失败", "请先填写 SiliconFlow API Key。")
+            return
+
+        payload = {
+            "model": model,
+            "messages": [{"role": "user", "content": "ping"}],
+            "max_tokens": 16,
+        }
+        req = urllib.request.Request(
+            SILICONFLOW_URL,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {api_key}",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                text = resp.read().decode("utf-8", errors="replace")
+            data = json.loads(text)
+            content = (
+                data.get("choices", [{}])[0]
+                .get("message", {})
+                .get("content", "")
+                .strip()
+            )
+            self._log(f"[ok] 模型连接测试成功: {model}")
+            QMessageBox.information(
+                self,
+                "模型连接测试",
+                f"模型可用: {model}\n返回: {content or '(empty)'}",
+            )
+        except Exception as exc:
+            self._log(f"[ERR] 模型连接测试失败: {model} -> {exc}")
+            QMessageBox.warning(
+                self,
+                "模型连接测试失败",
+                f"模型: {model}\n错误: {exc}",
+            )
+
     def _on_ai_result(self, ok: bool, message: str):
         if self.ai_ask_btn:
             self.ai_ask_btn.setEnabled(True)
@@ -1310,7 +1368,7 @@ class RepoSyncWindow(QMainWindow):
         if not api_key:
             self._log(f"[WARN] {pkg_name} 未填写 AI Key，将改为手动输入提交注释")
             return None
-        model = self.model_edit.text().strip() or DEFAULT_SILICONFLOW_MODEL
+        model = self.model_edit.currentText().strip() or DEFAULT_SILICONFLOW_MODEL
 
         ok_name_status, name_status = self._run(
             ["git", "diff", "--cached", "--name-status"], cwd=pkg_dir
