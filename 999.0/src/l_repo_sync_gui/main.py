@@ -1,5 +1,6 @@
 import argparse
 import datetime
+import difflib
 import json
 import os
 import shutil
@@ -12,6 +13,7 @@ import urllib.request
 from pathlib import Path
 
 from PySide6.QtCore import QObject, Qt, Signal
+from PySide6.QtGui import QColor, QSyntaxHighlighter, QTextCharFormat
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -53,10 +55,18 @@ IGNORE_LINES = [
 SKIP_DIRS = {"repo_tools"}
 PREVIEW_MAX_LINES = 300
 SILICONFLOW_URL = "https://api.siliconflow.cn/v1/chat/completions"
-DEFAULT_SILICONFLOW_MODEL = "Qwen/Qwen2.5-7B-Instruct"
+# 国内硅基流动：直连，不走系统/环境代理（避免误走公司代理导致失败或变慢）
+_SILICONFLOW_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def _siliconflow_urlopen(req: urllib.request.Request, timeout: float):
+    return _SILICONFLOW_OPENER.open(req, timeout=timeout)
+
+
+DEFAULT_SILICONFLOW_MODEL = "Qwen/Qwen2.5-72B-Instruct"
 MODEL_PRESETS = [
-    "Qwen/Qwen2.5-7B-Instruct",
-    "Qwen/Qwen2.5-14B-Instruct",
+    "Qwen/Qwen2.5-72B-Instruct",
+    "deepseek-ai/DeepSeek-V4-Flash",
     "Pro/zai-org/GLM-4.7",
 ]
 DEFAULT_SILICONFLOW_KEY = "sk-gzwtmzfhglvibdbvrttmsuuqsyyjxghxlxzdhubdefmshqoi"
@@ -79,6 +89,31 @@ class _AiStreamBridge(QObject):
     status = Signal(str)
     chunk = Signal(str)
     finished = Signal(bool, str)
+
+
+class _DiffHighlighter(QSyntaxHighlighter):
+    """简单 diff 语法高亮。"""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self._fmt_add = QTextCharFormat()
+        self._fmt_add.setForeground(QColor("#7CFC00"))
+        self._fmt_del = QTextCharFormat()
+        self._fmt_del.setForeground(QColor("#FF6B6B"))
+        self._fmt_hunk = QTextCharFormat()
+        self._fmt_hunk.setForeground(QColor("#7AA2F7"))
+        self._fmt_file = QTextCharFormat()
+        self._fmt_file.setForeground(QColor("#E5C07B"))
+
+    def highlightBlock(self, text: str):
+        if text.startswith("+++ ") or text.startswith("--- ") or text.startswith("diff --git "):
+            self.setFormat(0, len(text), self._fmt_file)
+        elif text.startswith("@@"):
+            self.setFormat(0, len(text), self._fmt_hunk)
+        elif text.startswith("+"):
+            self.setFormat(0, len(text), self._fmt_add)
+        elif text.startswith("-"):
+            self.setFormat(0, len(text), self._fmt_del)
 
 
 class RepoSyncWindow(QMainWindow):
@@ -703,6 +738,7 @@ class RepoSyncWindow(QMainWindow):
         overview = QTextEdit(dlg)
         overview.setReadOnly(True)
         overview.setPlainText("\n".join(clipped))
+        self._apply_diff_highlight(overview)
         tabs.addTab(overview, "总览")
 
         file_blocks = self._extract_file_diff_blocks(clipped)
@@ -710,6 +746,7 @@ class RepoSyncWindow(QMainWindow):
             editor = QTextEdit(dlg)
             editor.setReadOnly(True)
             editor.setPlainText(block)
+            self._apply_diff_highlight(editor)
             tabs.addTab(editor, self._safe_tab_name(file_name))
 
         main_content_splitter = QSplitter(Qt.Horizontal, dlg)
@@ -880,6 +917,13 @@ class RepoSyncWindow(QMainWindow):
         current_lines: list[str] = []
 
         for line in lines:
+            if line.startswith("[未跟踪文件 diff] "):
+                if current_name and current_lines:
+                    blocks.append((current_name, "\n".join(current_lines)))
+                abs_path = line.split("] ", 1)[1].strip() if "] " in line else line
+                current_name = Path(abs_path).name or f"untracked_{len(blocks) + 1}"
+                current_lines = [line]
+                continue
             if line.startswith("diff --git "):
                 if current_name and current_lines:
                     blocks.append((current_name, "\n".join(current_lines)))
@@ -896,6 +940,11 @@ class RepoSyncWindow(QMainWindow):
         if current_name and current_lines:
             blocks.append((current_name, "\n".join(current_lines)))
         return blocks
+
+    @staticmethod
+    def _apply_diff_highlight(editor: QTextEdit):
+        highlighter = _DiffHighlighter(editor.document())
+        setattr(editor, "_diff_highlighter", highlighter)
 
     def _build_ai_detailed_review_prompt(self, pkg_name: str, preview_text: str) -> str:
         """构建 AI 详细分析 prompt。"""
@@ -948,7 +997,7 @@ class RepoSyncWindow(QMainWindow):
         try:
             on_status("[INFO] 请求已发送，等待流式响应...")
             chunks: list[str] = []
-            with urllib.request.urlopen(req, timeout=90) as resp:
+            with _siliconflow_urlopen(req, 90) as resp:
                 for raw in resp:
                     line = raw.decode("utf-8", errors="replace").strip()
                     if not line:
@@ -1012,6 +1061,11 @@ class RepoSyncWindow(QMainWindow):
             out.append("")
             out.append("[本地未提交改动]")
             out.extend(local_pending or ["(无本地未提交改动)"])
+            local_diff = self._local_uncommitted_diff_lines(pkg_dir, status_lines if ok_status else [])
+            if local_diff:
+                out.append("")
+                out.append("[本地未提交改动 diff]")
+                out.extend(local_diff)
             return out
 
         upstream_ref = upstream.strip().splitlines()[-1]
@@ -1025,6 +1079,11 @@ class RepoSyncWindow(QMainWindow):
             out.append("")
             out.append("[本地未提交改动]")
             out.extend(local_pending or ["(无本地未提交改动)"])
+            local_diff = self._local_uncommitted_diff_lines(pkg_dir, status_lines if ok_status else [])
+            if local_diff:
+                out.append("")
+                out.append("[本地未提交改动 diff]")
+                out.extend(local_diff)
             return out
 
         lines = [line for line in (msg_name or "").splitlines() if line.strip()]
@@ -1040,6 +1099,11 @@ class RepoSyncWindow(QMainWindow):
         out.append("")
         out.append("[本地未提交改动]")
         out.extend(local_pending or ["(无本地未提交改动)"])
+        local_diff = self._local_uncommitted_diff_lines(pkg_dir, status_lines if ok_status else [])
+        if local_diff:
+            out.append("")
+            out.append("[本地未提交改动 diff]")
+            out.extend(local_diff)
         return out
 
     def _format_status_lines_with_full_path(self, pkg_dir: Path, status_lines: list[str]) -> list[str]:
@@ -1064,6 +1128,48 @@ class RepoSyncWindow(QMainWindow):
                 rel = rel[1:-1]
             abs_path = str((pkg_dir / rel).resolve())
             out.append(f"{status} {abs_path}")
+        return out
+
+    def _local_uncommitted_diff_lines(self, pkg_dir: Path, status_lines: list[str]) -> list[str]:
+        """返回本地未提交改动 diff，含 ?? 未跟踪文件内容。"""
+        out: list[str] = []
+        ok_unstaged, msg_unstaged = self._run(["git", "diff", "--patch"], cwd=pkg_dir)
+        if ok_unstaged and (msg_unstaged or "").strip():
+            out.extend(["[未暂存改动 diff]", msg_unstaged.strip(), ""])
+
+        ok_staged, msg_staged = self._run(["git", "diff", "--cached", "--patch"], cwd=pkg_dir)
+        if ok_staged and (msg_staged or "").strip():
+            out.extend(["[已暂存改动 diff]", msg_staged.strip(), ""])
+
+        for raw in status_lines:
+            line = (raw or "").rstrip()
+            if not line.startswith("?? "):
+                continue
+            rel = line[3:].strip()
+            if rel.startswith('"') and rel.endswith('"') and len(rel) >= 2:
+                rel = rel[1:-1]
+            file_path = (pkg_dir / rel).resolve()
+            if not file_path.is_file():
+                continue
+            try:
+                text = file_path.read_text(encoding="utf-8", errors="replace")
+                content_lines = text.splitlines()
+                diff_lines = list(
+                    difflib.unified_diff(
+                        [],
+                        content_lines,
+                        fromfile="/dev/null",
+                        tofile=f"b/{rel.replace(os.sep, '/')}",
+                        lineterm="",
+                    )
+                )
+                if diff_lines:
+                    out.append(f"[未跟踪文件 diff] {file_path}")
+                    out.extend(diff_lines)
+                    out.append("")
+            except Exception as exc:
+                out.append(f"[未跟踪文件 diff] 读取失败: {file_path} ({exc})")
+                out.append("")
         return out
 
     def _preview_download_files(self, pkg_dir: Path) -> list[str]:
@@ -1349,7 +1455,7 @@ class RepoSyncWindow(QMainWindow):
                 method="POST",
             )
             try:
-                with urllib.request.urlopen(req, timeout=60) as resp:
+                with _siliconflow_urlopen(req, 60) as resp:
                     text = resp.read().decode("utf-8", errors="replace")
                 data = json.loads(text)
                 content = (
@@ -1391,7 +1497,7 @@ class RepoSyncWindow(QMainWindow):
             method="POST",
         )
         try:
-            with urllib.request.urlopen(req, timeout=20) as resp:
+            with _siliconflow_urlopen(req, 5) as resp:
                 text = resp.read().decode("utf-8", errors="replace")
             data = json.loads(text)
             content = (
@@ -1477,7 +1583,7 @@ class RepoSyncWindow(QMainWindow):
             method="POST",
         )
         try:
-            with urllib.request.urlopen(req, timeout=45) as resp:
+            with _siliconflow_urlopen(req, 45) as resp:
                 text = resp.read().decode("utf-8", errors="replace")
             data = json.loads(text)
             content = (
