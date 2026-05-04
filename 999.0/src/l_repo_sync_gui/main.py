@@ -398,7 +398,10 @@ class RepoSyncWindow(QMainWindow):
             self._run(["git", "add", "-A"], cwd=pkg_dir)
             ok, _ = self._run(["git", "diff", "--cached", "--quiet"], cwd=pkg_dir)
             if not ok:
-                commit_msg = f"sync {pkg_name}\n\nl_repo_sync_gui automated commit"
+                ai_commit_msg = self._request_ai_commit_message(pkg_name, pkg_dir)
+                commit_msg = ai_commit_msg or f"sync {pkg_name}\n\nl_repo_sync_gui automated commit"
+                if ai_commit_msg:
+                    self._log(f"[ok] {pkg_name} 使用 AI 生成提交注释")
                 ok_commit, msg_commit = self._run(
                     ["git", "commit", "-m", commit_msg], cwd=pkg_dir
                 )
@@ -576,6 +579,74 @@ class RepoSyncWindow(QMainWindow):
             self._log("[ok] 问AI完成")
         else:
             self._log(f"[ERR] 问AI失败: {message}")
+
+    def _request_ai_commit_message(self, pkg_name: str, pkg_dir: Path) -> str | None:
+        api_key = self.api_key_edit.text().strip()
+        if not api_key:
+            return None
+        model = self.model_edit.text().strip() or DEFAULT_SILICONFLOW_MODEL
+
+        ok_name_status, name_status = self._run(
+            ["git", "diff", "--cached", "--name-status"], cwd=pkg_dir
+        )
+        if not ok_name_status:
+            return None
+        ok_patch_stat, patch_stat = self._run(
+            ["git", "diff", "--cached", "--stat"], cwd=pkg_dir
+        )
+        if not ok_patch_stat:
+            patch_stat = ""
+
+        changed = (name_status or "").strip()
+        stat = (patch_stat or "").strip()
+        if not changed and not stat:
+            return None
+
+        prompt = (
+            "请基于以下 git 变更生成一个简洁的 commit message。\n"
+            "要求：\n"
+            "1) 第一行 50 字以内，使用中文或英文均可。\n"
+            "2) 空一行后补充 1-2 句说明目的。\n"
+            "3) 不要加引号、不要 markdown。\n\n"
+            f"包名: {pkg_name}\n\n"
+            "变更文件(name-status):\n"
+            f"{changed}\n\n"
+            "变更统计(stat):\n"
+            f"{stat}"
+        )
+
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": "你是一个有用的助手，擅长写清晰的 git 提交信息。"},
+                {"role": "user", "content": prompt},
+            ],
+        }
+        req = urllib.request.Request(
+            SILICONFLOW_URL,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {api_key}",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=45) as resp:
+                text = resp.read().decode("utf-8", errors="replace")
+            data = json.loads(text)
+            content = (
+                data.get("choices", [{}])[0]
+                .get("message", {})
+                .get("content", "")
+                .strip()
+            )
+            if not content:
+                return None
+            return content
+        except Exception as exc:
+            self._log(f"[WARN] AI 生成提交注释失败，使用默认注释: {exc}")
+            return None
 
 
 def main():
