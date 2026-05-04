@@ -5,6 +5,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -50,8 +51,9 @@ IGNORE_LINES = [
 SKIP_DIRS = {"repo_tools"}
 PREVIEW_MAX_LINES = 300
 SILICONFLOW_URL = "https://api.siliconflow.cn/v1/chat/completions"
-DEFAULT_SILICONFLOW_MODEL = "Pro/zai-org/GLM-4.7"
+DEFAULT_SILICONFLOW_MODEL = "Qwen/Qwen3.6-35B-A3B"
 DEFAULT_SILICONFLOW_KEY = "sk-gzwtmzfhglvibdbvrttmsuuqsyyjxghxlxzdhubdefmshqoi"
+AUTH_CONFIG_FILE = Path.home() / ".l_repo_sync_gui_auth.json"
 
 
 def _find_rez_source_root() -> Path:
@@ -86,6 +88,9 @@ class RepoSyncWindow(QMainWindow):
         self.git_path_edit.setPlaceholderText("git.exe path (optional, auto-detect if empty)")
         self.gh_path_edit = QLineEdit()
         self.gh_path_edit.setPlaceholderText("gh.exe path (optional, auto-detect if empty)")
+        self.gh_token_edit = QLineEdit()
+        self.gh_token_edit.setPlaceholderText("GitHub token (used by GH_TOKEN)")
+        self.gh_token_edit.setEchoMode(QLineEdit.Password)
         self.force_push_checkbox = QCheckBox("强制本地覆盖远端（--force-with-lease）")
         self.force_push_checkbox.setToolTip("仅上传时生效。会用本地提交覆盖远端分支，请谨慎使用。")
         self.api_key_edit = QLineEdit(
@@ -173,6 +178,24 @@ class RepoSyncWindow(QMainWindow):
         gh_line.addWidget(self.gh_path_edit, 1)
         top_lay.addLayout(gh_line)
 
+        auth_line = QHBoxLayout()
+        auth_line.setSpacing(8)
+        auth_line.addWidget(QLabel("GitHub Token:"))
+        auth_line.addWidget(self.gh_token_edit, 1)
+        btn_save_token = QPushButton("保存Token")
+        btn_save_token.clicked.connect(self._save_auth_settings)
+        auth_line.addWidget(btn_save_token)
+        btn_clear_token = QPushButton("清除Token")
+        btn_clear_token.clicked.connect(self._clear_auth_token)
+        auth_line.addWidget(btn_clear_token)
+        btn_auth_status = QPushButton("检查授权")
+        btn_auth_status.clicked.connect(self._check_github_auth)
+        auth_line.addWidget(btn_auth_status)
+        btn_gh_login = QPushButton("网页登录授权")
+        btn_gh_login.clicked.connect(self._start_gh_auth_login)
+        auth_line.addWidget(btn_gh_login)
+        top_lay.addLayout(auth_line)
+
         top_lay.addWidget(self.force_push_checkbox)
         main_layout.addWidget(top_bar)
 
@@ -238,6 +261,7 @@ class RepoSyncWindow(QMainWindow):
 
         self.setCentralWidget(root)
         self._init_gh_path()
+        self._load_auth_settings()
 
     def _init_gh_path(self):
         """初始化 git/gh 路径输入框：优先环境变量，其次自动探测。"""
@@ -256,6 +280,71 @@ class RepoSyncWindow(QMainWindow):
         auto = self._resolve_gh_executable(from_manual=False)
         if auto:
             self.gh_path_edit.setText(auto)
+
+    def _load_auth_settings(self):
+        """加载本地 GitHub token 配置。"""
+        try:
+            if not AUTH_CONFIG_FILE.exists():
+                return
+            data = json.loads(AUTH_CONFIG_FILE.read_text(encoding="utf-8"))
+            token = str(data.get("github_token") or "").strip()
+            if token:
+                self.gh_token_edit.setText(token)
+        except Exception as exc:
+            self._log(f"[WARN] 加载授权配置失败: {exc}")
+
+    def _save_auth_settings(self):
+        """保存 GitHub token 到本地配置文件。"""
+        token = (self.gh_token_edit.text() or "").strip()
+        payload = {"github_token": token}
+        try:
+            AUTH_CONFIG_FILE.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            self._log(f"[ok] 已保存授权配置: {AUTH_CONFIG_FILE}")
+            QMessageBox.information(self, "保存成功", "GitHub Token 已保存。")
+        except Exception as exc:
+            self._log(f"[ERR] 保存授权配置失败: {exc}")
+            QMessageBox.warning(self, "保存失败", str(exc))
+
+    def _clear_auth_token(self):
+        self.gh_token_edit.clear()
+        self._save_auth_settings()
+        self._log("[info] 已清除 GitHub Token。")
+
+    def _check_github_auth(self):
+        ok, msg = self._run(["gh", "auth", "status"])
+        if ok:
+            QMessageBox.information(self, "GitHub 授权状态", msg or "已授权。")
+        else:
+            QMessageBox.warning(self, "GitHub 授权状态", msg or "未授权。")
+
+    def _start_gh_auth_login(self):
+        gh_exe = self._resolve_gh_executable()
+        if not gh_exe:
+            QMessageBox.warning(self, "启动失败", "未找到 gh.exe，请先设置路径。")
+            return
+        try:
+            subprocess.Popen(
+                [
+                    gh_exe,
+                    "auth",
+                    "login",
+                    "--web",
+                    "--clipboard",
+                    "--hostname",
+                    "github.com",
+                    "--git-protocol",
+                    "https",
+                ],
+                shell=False,
+                creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0x00000010),
+            )
+            self._log("[info] 已启动网页登录授权（已复制授权码到剪贴板并打开网页）。")
+        except Exception as exc:
+            self._log(f"[ERR] 启动 gh auth login 失败: {exc}")
+            QMessageBox.warning(self, "启动失败", str(exc))
 
     def _resolve_git_executable(self, from_manual: bool = True) -> str | None:
         """返回可执行 git 路径（优先用户输入）。"""
@@ -329,12 +418,18 @@ class RepoSyncWindow(QMainWindow):
             effective_cmd[0] = gh_exe
 
         self._log(f"$ {' '.join(effective_cmd)}")
+        run_env = os.environ.copy()
+        gh_token = (self.gh_token_edit.text() or "").strip()
+        if gh_token:
+            run_env["GH_TOKEN"] = gh_token
+            run_env["GITHUB_TOKEN"] = gh_token
         try:
             result = subprocess.run(
                 effective_cmd,
                 cwd=str(cwd) if cwd else None,
                 capture_output=True,
                 text=False,
+                env=run_env,
             )
         except Exception as exc:
             return False, str(exc)
@@ -488,6 +583,41 @@ class RepoSyncWindow(QMainWindow):
         branch = (msg or "").strip().splitlines()[-1] if ok and msg.strip() else "main"
         return branch or "main"
 
+    @staticmethod
+    def _should_try_create_repo(push_err: str) -> bool:
+        """仅在明显“远端仓库不存在”时才尝试 gh repo create。"""
+        low = (push_err or "").lower()
+        repo_not_found_markers = [
+            "repository not found",
+            "remote: repository not found",
+            "not found",
+            "does not appear to be a git repository",
+            "could not read from remote repository",
+        ]
+        network_markers = [
+            "ssl_error_syscall",
+            "failed to connect",
+            "timed out",
+            "connection reset",
+            "connection aborted",
+            "eof",
+            "proxyerror",
+            "unable to access",
+        ]
+        reject_markers = [
+            "non-fast-forward",
+            "rejected",
+            "fetch first",
+            "tip of your current branch is behind",
+            "protected branch",
+            "permission denied",
+        ]
+        if any(m in low for m in network_markers):
+            return False
+        if any(m in low for m in reject_markers):
+            return False
+        return any(m in low for m in repo_not_found_markers)
+
     def _clip_lines(self, lines: list[str], limit: int = PREVIEW_MAX_LINES) -> list[str]:
         clipped = [x for x in lines if x is not None]
         if len(clipped) > limit:
@@ -548,6 +678,7 @@ class RepoSyncWindow(QMainWindow):
 
         ai_detail_edit: QTextEdit | None = None
         ai_use_as_commit = None
+        dialog_force_push = None
         if enable_ai:
             ai_panel = QWidget(dlg)
             ai_panel_lay = QVBoxLayout(ai_panel)
@@ -562,6 +693,15 @@ class RepoSyncWindow(QMainWindow):
             ai_bar.addWidget(ai_btn)
             ai_bar.addWidget(ai_status, 1)
             ai_panel_lay.addLayout(ai_bar)
+
+            token_line = QHBoxLayout()
+            token_line.setSpacing(8)
+            in_token_label = QLabel("输入Token(估算): 0")
+            out_token_label = QLabel("输出Token(估算): 0")
+            token_line.addWidget(in_token_label)
+            token_line.addWidget(out_token_label)
+            token_line.addStretch()
+            ai_panel_lay.addLayout(token_line)
 
             ai_input_edit = QTextEdit(dlg)
             ai_input_edit.setReadOnly(True)
@@ -584,6 +724,10 @@ class RepoSyncWindow(QMainWindow):
             ai_use_as_commit.setChecked(True)
             ai_panel_lay.addWidget(ai_use_as_commit)
 
+            dialog_force_push = QCheckBox("本次上传使用强制推送（--force-with-lease）")
+            dialog_force_push.setChecked(self.force_push_checkbox.isChecked())
+            ai_panel_lay.addWidget(dialog_force_push)
+
             stream_bridge = _AiStreamBridge()
             current_ai_text = {"text": ""}
 
@@ -596,6 +740,9 @@ class RepoSyncWindow(QMainWindow):
                     return
                 current_ai_text["text"] += chunk
                 ai_detail_edit.setPlainText(current_ai_text["text"])
+                out_token_label.setText(
+                    f"输出Token(估算): {self._estimate_token_count(current_ai_text['text'])}"
+                )
                 cursor = ai_detail_edit.textCursor()
                 cursor.movePosition(cursor.MoveOperation.End)
                 ai_detail_edit.setTextCursor(cursor)
@@ -627,6 +774,8 @@ class RepoSyncWindow(QMainWindow):
                 ai_input_lines = self._clip_lines(clipped, limit=1200)
                 prompt = self._build_ai_detailed_review_prompt(pkg_name, "\n".join(ai_input_lines))
                 ai_input_edit.setPlainText(prompt)
+                in_token_label.setText(f"输入Token(估算): {self._estimate_token_count(prompt)}")
+                out_token_label.setText("输出Token(估算): 0")
                 stream_bridge.status.emit("[INFO] 已构建输入，开始请求 AI（stream）。")
 
                 def _worker():
@@ -660,6 +809,9 @@ class RepoSyncWindow(QMainWindow):
         btn_row.addWidget(btn_no)
         layout.addLayout(btn_row)
         accepted = dlg.exec() == QDialog.Accepted
+        if accepted and enable_ai and dialog_force_push is not None:
+            # 与主界面保持一致，便于后续 push 逻辑复用现有开关。
+            self.force_push_checkbox.setChecked(dialog_force_push.isChecked())
         commit_msg_from_ai = None
         if (
             accepted
@@ -718,6 +870,13 @@ class RepoSyncWindow(QMainWindow):
             f"{preview_text}"
         )
 
+    @staticmethod
+    def _estimate_token_count(text: str) -> int:
+        """简易 token 估算：按 UTF-8 字节长度约 4 字节/token。"""
+        if not text:
+            return 0
+        return max(1, len(text.encode("utf-8")) // 4)
+
     def _stream_ai_detailed_review(
         self,
         prompt: str,
@@ -771,7 +930,10 @@ class RepoSyncWindow(QMainWindow):
                     )
                     if delta:
                         chunks.append(delta)
-                        on_chunk(delta)
+                        # 逐字输出，确保可见“流式打字”效果。
+                        for ch in delta:
+                            on_chunk(ch)
+                            time.sleep(0.005)
             content = "".join(chunks).strip()
             if not content:
                 return False, "AI 返回为空"
@@ -796,16 +958,48 @@ class RepoSyncWindow(QMainWindow):
         return [f"[{title}]"] + body
 
     def _preview_upload_files(self, pkg_dir: Path) -> list[str]:
+        """上传确认显示远端差异，并补充本地未提交改动提示。"""
+        self._run(["git", "fetch", "--all", "--prune"], cwd=pkg_dir)
+        ok_up, upstream = self._run(
+            ["git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"], cwd=pkg_dir
+        )
+        out: list[str] = []
         ok_status, status_lines = self._status_lines(pkg_dir)
-        if not ok_status:
-            return status_lines
-        out = ["[上传预览] 本地将覆盖远端（push）", "", "[文件列表: git status --porcelain]"]
-        out.extend(self._format_status_lines_with_full_path(pkg_dir, status_lines) or ["(无本地文件变化)"])
+        local_pending = self._format_status_lines_with_full_path(pkg_dir, status_lines) if ok_status else []
+
+        if not ok_up or not upstream.strip():
+            out.append("[远端差异预览] 无上游分支，推送时将按当前分支创建/关联远端。")
+            out.append("")
+            out.append("[本地未提交改动]")
+            out.extend(local_pending or ["(无本地未提交改动)"])
+            return out
+
+        upstream_ref = upstream.strip().splitlines()[-1]
+        out.extend([f"[远端差异预览] 本地 HEAD -> 远端 {upstream_ref}", "", "[文件列表: name-status]"])
+
+        ok_name, msg_name = self._run(
+            ["git", "diff", "--name-status", f"{upstream_ref}..HEAD"], cwd=pkg_dir
+        )
+        if not ok_name:
+            out.append(f"[远端差异预览] 获取失败: {msg_name}")
+            out.append("")
+            out.append("[本地未提交改动]")
+            out.extend(local_pending or ["(无本地未提交改动)"])
+            return out
+
+        lines = [line for line in (msg_name or "").splitlines() if line.strip()]
+        out.extend(lines or ["(当前无已提交差异可推送)"])
         out.append("")
-        # 显示 tracked 文件变更，便于确认“每个文件改了什么”。
-        out.extend(self._diff_lines(pkg_dir, ["git", "diff", "--patch"], "工作区修改 diff"))
+        out.extend(
+            self._diff_lines(
+                pkg_dir,
+                ["git", "diff", "--patch", f"{upstream_ref}..HEAD"],
+                "将推送到远端的提交差异 diff",
+            )
+        )
         out.append("")
-        out.extend(self._diff_lines(pkg_dir, ["git", "diff", "--cached", "--patch"], "已暂存修改 diff"))
+        out.append("[本地未提交改动]")
+        out.extend(local_pending or ["(无本地未提交改动)"])
         return out
 
     def _format_status_lines_with_full_path(self, pkg_dir: Path, status_lines: list[str]) -> list[str]:
@@ -904,6 +1098,7 @@ class RepoSyncWindow(QMainWindow):
                     self._log(f"[info] {pkg_name} 使用手动提交注释")
                 if ai_commit_msg:
                     self._log(f"[ok] {pkg_name} 使用 AI 生成提交注释")
+                commit_msg = commit_msg or ""
                 ok_commit, msg_commit = self._run(
                     ["git", "commit", "-m", commit_msg], cwd=pkg_dir
                 )
@@ -936,7 +1131,21 @@ class RepoSyncWindow(QMainWindow):
                 self._log(f"[ok] {pkg_name} pushed")
                 return
 
-            self._log(f"[info] push 失败，尝试 gh repo create: {msg_push}")
+            if not self._should_try_create_repo(msg_push):
+                self._log(f"[ERR] {pkg_name} push 失败（不满足自动建仓条件）: {msg_push}")
+                QMessageBox.warning(
+                    self,
+                    "上传失败",
+                    (
+                        f"{pkg_name} push 失败。\n\n"
+                        "本次错误不是“仓库不存在”，已跳过自动 gh repo create。\n"
+                        "请检查网络/远端状态后重试。\n\n"
+                        f"详情:\n{msg_push}"
+                    ),
+                )
+                return
+
+            self._log(f"[info] push 失败，检测为仓库不存在，尝试 gh repo create: {msg_push}")
             if not self._resolve_gh_executable():
                 self._log("[ERR] 未找到 gh.exe，无法自动创建远端仓库")
                 QMessageBox.warning(
