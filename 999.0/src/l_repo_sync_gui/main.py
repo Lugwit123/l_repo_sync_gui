@@ -1,11 +1,17 @@
 import datetime
+import json
+import os
 import subprocess
 import sys
+import threading
+import urllib.error
+import urllib.request
 from pathlib import Path
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QObject, Qt, Signal
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -37,6 +43,9 @@ IGNORE_LINES = [
 
 SKIP_DIRS = {"repo_tools"}
 PREVIEW_MAX_LINES = 300
+SILICONFLOW_URL = "https://api.siliconflow.cn/v1/chat/completions"
+DEFAULT_SILICONFLOW_MODEL = "Pro/zai-org/GLM-4.7"
+DEFAULT_SILICONFLOW_KEY = "sk-gzwtmzfhglvibdbvrttmsuuqsyyjxghxlxzdhubdefmshqoi"
 
 
 def _find_rez_source_root() -> Path:
@@ -45,6 +54,10 @@ def _find_rez_source_root() -> Path:
         if parent.name == "rez-package-source":
             return parent
     raise RuntimeError("Cannot find rez-package-source from current script path.")
+
+
+class _AiBridge(QObject):
+    finished = Signal(bool, str)
 
 
 class RepoSyncWindow(QMainWindow):
@@ -56,6 +69,25 @@ class RepoSyncWindow(QMainWindow):
 
         self.owner_edit = QLineEdit("Lugwit123")
         self.owner_edit.setPlaceholderText("GitHub owner, e.g. Lugwit123")
+        self.force_push_checkbox = QCheckBox("强制本地覆盖远端（--force-with-lease）")
+        self.force_push_checkbox.setToolTip("仅上传时生效。会用本地提交覆盖远端分支，请谨慎使用。")
+        self.api_key_edit = QLineEdit(
+            os.environ.get("SILICONFLOW_API_KEY", DEFAULT_SILICONFLOW_KEY)
+        )
+        self.api_key_edit.setEchoMode(QLineEdit.Password)
+        self.api_key_edit.setPlaceholderText("SiliconFlow API Key")
+        self.model_edit = QLineEdit(DEFAULT_SILICONFLOW_MODEL)
+        self.model_edit.setPlaceholderText("SiliconFlow model")
+        self.ai_prompt_edit = QTextEdit()
+        self.ai_prompt_edit.setPlaceholderText("输入问题，例如：请总结当前上传预览的风险点")
+        self.ai_prompt_edit.setFixedHeight(72)
+        self.ai_answer_edit = QTextEdit()
+        self.ai_answer_edit.setReadOnly(True)
+        self.ai_answer_edit.setFixedHeight(140)
+        self.ai_ask_btn: QPushButton | None = None
+        self.ai_bridge = _AiBridge()
+        self.ai_bridge.finished.connect(self._on_ai_result)
+
         self.log_edit = QTextEdit()
         self.log_edit.setReadOnly(True)
         self.row_buttons = []
@@ -87,6 +119,22 @@ class RepoSyncWindow(QMainWindow):
         btn_restart.clicked.connect(self.restart_self)
         owner_line.addWidget(btn_restart)
         main_layout.addLayout(owner_line)
+        main_layout.addWidget(self.force_push_checkbox)
+
+        ai_line = QHBoxLayout()
+        ai_line.addWidget(QLabel("硅基 Key:"))
+        ai_line.addWidget(self.api_key_edit, 2)
+        ai_line.addWidget(QLabel("模型:"))
+        ai_line.addWidget(self.model_edit, 1)
+        self.ai_ask_btn = QPushButton("问AI")
+        self.ai_ask_btn.clicked.connect(self.ask_ai)
+        ai_line.addWidget(self.ai_ask_btn)
+        main_layout.addLayout(ai_line)
+
+        main_layout.addWidget(QLabel("AI提问:"))
+        main_layout.addWidget(self.ai_prompt_edit)
+        main_layout.addWidget(QLabel("AI回复:"))
+        main_layout.addWidget(self.ai_answer_edit)
 
         self.list_area = QScrollArea()
         self.list_area.setWidgetResizable(True)
@@ -349,9 +397,26 @@ class RepoSyncWindow(QMainWindow):
             else:
                 self._log(f"[info] {pkg_name} no changes to commit")
 
-            ok_push, msg_push = self._run(
-                ["git", "push", "-u", "origin", branch], cwd=pkg_dir
-            )
+            push_cmd = ["git", "push", "-u", "origin", branch]
+            if self.force_push_checkbox.isChecked():
+                confirm = QMessageBox.question(
+                    self,
+                    "二次确认强制覆盖",
+                    (
+                        f"{pkg_name} 将执行强制推送：\n"
+                        f"git push -u origin {branch} --force-with-lease\n\n"
+                        "这会用本地提交覆盖远端同分支历史，是否继续？"
+                    ),
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.No,
+                )
+                if confirm != QMessageBox.Yes:
+                    self._log(f"[info] {pkg_name} 取消强制上传")
+                    return
+                push_cmd.append("--force-with-lease")
+                self._log(f"[warn] {pkg_name} 已启用强制覆盖远端")
+
+            ok_push, msg_push = self._run(push_cmd, cwd=pkg_dir)
             if ok_push:
                 self._log(f"[ok] {pkg_name} pushed")
                 return
@@ -438,6 +503,69 @@ class RepoSyncWindow(QMainWindow):
         except Exception as exc:
             self._log(f"[ERR] 重启失败: {exc}")
             QMessageBox.warning(self, "重启失败", str(exc))
+
+    def ask_ai(self):
+        api_key = self.api_key_edit.text().strip()
+        model = self.model_edit.text().strip() or DEFAULT_SILICONFLOW_MODEL
+        user_prompt = self.ai_prompt_edit.toPlainText().strip()
+        if not api_key:
+            QMessageBox.warning(self, "问AI失败", "请先填写 SiliconFlow API Key。")
+            return
+        if not user_prompt:
+            QMessageBox.warning(self, "问AI失败", "请先输入提问内容。")
+            return
+        if self.ai_ask_btn:
+            self.ai_ask_btn.setEnabled(False)
+            self.ai_ask_btn.setText("请求中...")
+        self.ai_answer_edit.setPlainText("请求中，请稍候...")
+
+        def _worker():
+            payload = {
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": "你是一个有用的助手"},
+                    {"role": "user", "content": user_prompt},
+                ],
+            }
+            req = urllib.request.Request(
+                SILICONFLOW_URL,
+                data=json.dumps(payload).encode("utf-8"),
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {api_key}",
+                },
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=60) as resp:
+                    text = resp.read().decode("utf-8", errors="replace")
+                data = json.loads(text)
+                content = (
+                    data.get("choices", [{}])[0]
+                    .get("message", {})
+                    .get("content", "")
+                    .strip()
+                )
+                if not content:
+                    content = f"[接口返回为空]\n{text}"
+                self.ai_bridge.finished.emit(True, content)
+            except urllib.error.HTTPError as e:
+                body = e.read().decode("utf-8", errors="replace") if hasattr(e, "read") else str(e)
+                self.ai_bridge.finished.emit(False, f"HTTPError {e.code}: {body}")
+            except Exception as e:
+                self.ai_bridge.finished.emit(False, repr(e))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_ai_result(self, ok: bool, message: str):
+        if self.ai_ask_btn:
+            self.ai_ask_btn.setEnabled(True)
+            self.ai_ask_btn.setText("问AI")
+        self.ai_answer_edit.setPlainText(message)
+        if ok:
+            self._log("[ok] 问AI完成")
+        else:
+            self._log(f"[ERR] 问AI失败: {message}")
 
 
 def main():
