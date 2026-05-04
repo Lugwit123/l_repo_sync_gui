@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QMainWindow,
@@ -399,7 +400,19 @@ class RepoSyncWindow(QMainWindow):
             ok, _ = self._run(["git", "diff", "--cached", "--quiet"], cwd=pkg_dir)
             if not ok:
                 ai_commit_msg = self._request_ai_commit_message(pkg_name, pkg_dir)
-                commit_msg = ai_commit_msg or f"sync {pkg_name}\n\nl_repo_sync_gui automated commit"
+                commit_msg = ai_commit_msg
+                if not commit_msg:
+                    commit_msg, accepted = QInputDialog.getMultiLineText(
+                        self,
+                        "手动输入提交注释",
+                        f"{pkg_name} 的 AI 注释不可用，请手动输入 commit message:",
+                        f"sync {pkg_name}\n\nmanual commit message",
+                    )
+                    if not accepted or not commit_msg.strip():
+                        self._log(f"[info] {pkg_name} 未提供提交注释，取消上传")
+                        return
+                    commit_msg = commit_msg.strip()
+                    self._log(f"[info] {pkg_name} 使用手动提交注释")
                 if ai_commit_msg:
                     self._log(f"[ok] {pkg_name} 使用 AI 生成提交注释")
                 ok_commit, msg_commit = self._run(
@@ -583,6 +596,7 @@ class RepoSyncWindow(QMainWindow):
     def _request_ai_commit_message(self, pkg_name: str, pkg_dir: Path) -> str | None:
         api_key = self.api_key_edit.text().strip()
         if not api_key:
+            self._log(f"[WARN] {pkg_name} 未填写 AI Key，将改为手动输入提交注释")
             return None
         model = self.model_edit.text().strip() or DEFAULT_SILICONFLOW_MODEL
 
@@ -645,7 +659,7 @@ class RepoSyncWindow(QMainWindow):
                 return None
             return content
         except Exception as exc:
-            self._log(f"[WARN] AI 生成提交注释失败，使用默认注释: {exc}")
+            self._log(f"[WARN] AI 生成提交注释失败，将改为手动输入: {exc}")
             return None
 
 
