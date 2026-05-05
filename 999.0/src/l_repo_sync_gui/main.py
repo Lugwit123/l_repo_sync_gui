@@ -54,6 +54,8 @@ IGNORE_LINES = [
 
 SKIP_DIRS = {"repo_tools"}
 PREVIEW_MAX_LINES = 300
+# Git HTTPS：建立 TCP+TLS 连接阶段最长等待（秒），避免 SSL 握手长时间挂死
+GIT_HTTP_CONNECT_TIMEOUT_SEC = 5
 SILICONFLOW_URL = "https://api.siliconflow.cn/v1/chat/completions"
 # 国内硅基流动：直连，不走系统/环境代理（避免误走公司代理导致失败或变慢）
 _SILICONFLOW_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -138,6 +140,11 @@ class RepoSyncWindow(QMainWindow):
         self.gh_token_edit.setEchoMode(QLineEdit.Password)
         self.force_push_checkbox = QCheckBox("强制本地覆盖远端（--force-with-lease）")
         self.force_push_checkbox.setToolTip("仅上传时生效。会用本地提交覆盖远端分支，请谨慎使用。")
+        self.force_download_checkbox = QCheckBox("下载时强制覆盖本地（丢弃本地修改）")
+        self.force_download_checkbox.setToolTip(
+            "下载时使用 fetch + reset --hard + clean -fd，"
+            "会丢弃本地未提交改动和未跟踪文件，请谨慎使用。"
+        )
         self.api_key_edit = QLineEdit(
             os.environ.get("SILICONFLOW_API_KEY", DEFAULT_SILICONFLOW_KEY)
         )
@@ -246,6 +253,7 @@ class RepoSyncWindow(QMainWindow):
         top_lay.addLayout(auth_line)
 
         top_lay.addWidget(self.force_push_checkbox)
+        top_lay.addWidget(self.force_download_checkbox)
         main_layout.addWidget(top_bar)
 
         body_splitter = QSplitter(Qt.Horizontal)
@@ -462,7 +470,13 @@ class RepoSyncWindow(QMainWindow):
             git_exe = self._resolve_git_executable()
             if not git_exe:
                 return False, "git.exe not found"
-            effective_cmd[0] = git_exe
+            # 不修改全局 gitconfig，仅本次进程内生效
+            effective_cmd = [
+                git_exe,
+                "-c",
+                f"http.connectTimeout={GIT_HTTP_CONNECT_TIMEOUT_SEC}",
+                *cmd[1:],
+            ]
         elif cmd[0] == "gh":
             gh_exe = self._resolve_gh_executable()
             if not gh_exe:
@@ -471,6 +485,8 @@ class RepoSyncWindow(QMainWindow):
 
         self._log(f"$ {' '.join(effective_cmd)}")
         run_env = os.environ.copy()
+        if cmd[0] == "git":
+            run_env["GIT_HTTP_CONNECT_TIMEOUT"] = str(GIT_HTTP_CONNECT_TIMEOUT_SEC)
         gh_token = (self.gh_token_edit.text() or "").strip()
         if gh_token:
             run_env["GH_TOKEN"] = gh_token
@@ -1392,6 +1408,58 @@ class RepoSyncWindow(QMainWindow):
             if not confirmed:
                 self._log(f"[info] {pkg_name} 取消下载")
                 return
+            if self.force_download_checkbox.isChecked():
+                confirm = QMessageBox.question(
+                    self,
+                    "二次确认强制下载",
+                    (
+                        f"{pkg_name} 将强制覆盖本地工作区：\n"
+                        "1) git fetch --all --prune\n"
+                        "2) git reset --hard <upstream>\n"
+                        "3) git clean -fd\n\n"
+                        "这会丢弃本地未提交改动和未跟踪文件，是否继续？"
+                    ),
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.No,
+                )
+                if confirm != QMessageBox.Yes:
+                    self._log(f"[info] {pkg_name} 取消强制下载")
+                    return
+
+                ok_fetch, msg_fetch = self._run(["git", "fetch", "--all", "--prune"], cwd=pkg_dir)
+                if not ok_fetch:
+                    self._log(f"[ERR] {pkg_name} fetch 失败: {msg_fetch}")
+                    QMessageBox.warning(self, "下载失败", f"{pkg_name} fetch 失败:\n{msg_fetch}")
+                    return
+
+                ok_up, upstream = self._run(
+                    ["git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"], cwd=pkg_dir
+                )
+                if ok_up and upstream.strip():
+                    target_ref = upstream.strip().splitlines()[-1]
+                else:
+                    target_ref = f"origin/{self._current_branch(pkg_dir)}"
+                    self._log(f"[warn] {pkg_name} 无上游分支，回退使用 {target_ref}")
+
+                ok_reset, msg_reset = self._run(["git", "reset", "--hard", target_ref], cwd=pkg_dir)
+                if not ok_reset:
+                    self._log(f"[ERR] {pkg_name} reset --hard 失败: {msg_reset}")
+                    QMessageBox.warning(
+                        self,
+                        "下载失败",
+                        f"{pkg_name} reset --hard {target_ref} 失败:\n{msg_reset}",
+                    )
+                    return
+
+                ok_clean, msg_clean = self._run(["git", "clean", "-fd"], cwd=pkg_dir)
+                if not ok_clean:
+                    self._log(f"[ERR] {pkg_name} clean -fd 失败: {msg_clean}")
+                    QMessageBox.warning(self, "下载失败", f"{pkg_name} clean -fd 失败:\n{msg_clean}")
+                    return
+
+                self._log(f"[ok] {pkg_name} 强制下载完成（已覆盖本地）")
+                return
+
             ok_pull, msg_pull = self._run(["git", "pull", "--ff-only"], cwd=pkg_dir)
             if ok_pull:
                 self._log(f"[ok] {pkg_name} pulled")
