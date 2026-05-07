@@ -1,4 +1,6 @@
 import argparse
+import concurrent.futures
+import ctypes
 import datetime
 import difflib
 import json
@@ -13,7 +15,7 @@ import urllib.request
 from pathlib import Path
 
 from PySide6.QtCore import QObject, Qt, Signal
-from PySide6.QtGui import QColor, QSyntaxHighlighter, QTextCharFormat
+from PySide6.QtGui import QColor, QIcon, QSyntaxHighlighter, QTextCharFormat
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -73,6 +75,8 @@ MODEL_PRESETS = [
 ]
 DEFAULT_SILICONFLOW_KEY = "sk-gzwtmzfhglvibdbvrttmsuuqsyyjxghxlxzdhubdefmshqoi"
 AUTH_CONFIG_FILE = Path.home() / ".l_repo_sync_gui_auth.json"
+APP_ID = "lugwit.l_repo_sync_gui"
+APP_ICON_FILE = Path(__file__).resolve().with_name("app_icon.svg")
 
 
 def _find_rez_source_root() -> Path:
@@ -81,6 +85,17 @@ def _find_rez_source_root() -> Path:
         if parent.name == "rez-package-source":
             return parent
     raise RuntimeError("Cannot find rez-package-source from current script path.")
+
+
+def _set_windows_app_id():
+    """设置 Windows AppUserModelID，确保任务栏/通知图标归组一致。"""
+    if os.name != "nt":
+        return
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_ID)
+    except Exception:
+        # 非关键能力，失败时静默回退。
+        pass
 
 
 class _AiBridge(QObject):
@@ -128,6 +143,8 @@ class RepoSyncWindow(QMainWindow):
         self.setWindowTitle(title)
         self.resize(1280, 820)
         self.setMinimumSize(1100, 700)
+        if APP_ICON_FILE.exists():
+            self.setWindowIcon(QIcon(str(APP_ICON_FILE)))
 
         self.owner_edit = QLineEdit("Lugwit123")
         self.owner_edit.setPlaceholderText("GitHub owner, e.g. Lugwit123")
@@ -571,6 +588,93 @@ class RepoSyncWindow(QMainWindow):
             out.append(("wuwo", wuwo_dir))
         return out
 
+    @staticmethod
+    def _summarize_status_counts(status_lines: list[str]) -> dict[str, int]:
+        counts = {
+            "modified": 0,
+            "untracked": 0,
+            "conflicted": 0,
+            "deleted": 0,
+            "renamed": 0,
+            "staged": 0,
+        }
+        for raw in status_lines:
+            line = (raw or "").rstrip()
+            if not line:
+                continue
+            if line.startswith("?? "):
+                counts["untracked"] += 1
+                continue
+
+            xy = line[:2]
+            x = xy[0] if len(xy) > 0 else " "
+            y = xy[1] if len(xy) > 1 else " "
+            code_pair = {x, y}
+            if "U" in code_pair:
+                counts["conflicted"] += 1
+                continue
+            if x not in (" ", "?"):
+                counts["staged"] += 1
+            if "M" in code_pair:
+                counts["modified"] += 1
+            if "D" in code_pair:
+                counts["deleted"] += 1
+            if "R" in code_pair:
+                counts["renamed"] += 1
+        return counts
+
+    def _scan_package_status(self, pkg_dir: Path) -> tuple[bool, dict[str, int], str]:
+        """扫描单个包状态（给包列表统计使用，不写日志）。"""
+        if not (pkg_dir / ".git").is_dir():
+            return False, {}, "非git仓库"
+        git_exe = self._resolve_git_executable()
+        if not git_exe:
+            return False, {}, "未找到git.exe"
+        try:
+            proc = subprocess.run(
+                [git_exe, "status", "--porcelain"],
+                cwd=str(pkg_dir),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=15,
+                check=False,
+            )
+        except Exception as exc:
+            return False, {}, f"扫描失败: {exc}"
+
+        if proc.returncode != 0:
+            err = (proc.stderr or "").strip() or f"exit code={proc.returncode}"
+            return False, {}, f"扫描失败: {err}"
+
+        status_lines = [line for line in (proc.stdout or "").splitlines() if line.strip()]
+        return True, self._summarize_status_counts(status_lines), ""
+
+    @staticmethod
+    def _format_package_status_suffix(counts: dict[str, int], err: str) -> str:
+        if err:
+            return f" [{err}]"
+        if not counts:
+            return ""
+        parts: list[str] = []
+        if counts.get("modified", 0):
+            parts.append(f"修改{counts['modified']}")
+        if counts.get("staged", 0):
+            parts.append(f"暂存{counts['staged']}")
+        if counts.get("untracked", 0):
+            parts.append(f"未跟踪{counts['untracked']}")
+        if counts.get("deleted", 0):
+            parts.append(f"删除{counts['deleted']}")
+        if counts.get("renamed", 0):
+            parts.append(f"重命名{counts['renamed']}")
+        if counts.get("conflicted", 0):
+            parts.append(f"冲突{counts['conflicted']}")
+        if not parts:
+            return " [干净]"
+        return f" [{' / '.join(parts)}]"
+
     def refresh_packages(self):
         while self.list_layout.count():
             child = self.list_layout.takeAt(0)
@@ -578,16 +682,34 @@ class RepoSyncWindow(QMainWindow):
             if w:
                 w.deleteLater()
         self.row_buttons = []
+        package_entries = self._package_entries()
+        status_map: dict[str, tuple[dict[str, int], str]] = {}
+        max_workers = max(1, min(8, (os.cpu_count() or 4), len(package_entries) or 1))
+        if package_entries:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {
+                    executor.submit(self._scan_package_status, pkg_dir): pkg_name
+                    for pkg_name, pkg_dir in package_entries
+                }
+                for future in concurrent.futures.as_completed(futures):
+                    pkg_name = futures[future]
+                    try:
+                        ok, counts, err = future.result()
+                    except Exception as exc:
+                        ok, counts, err = False, {}, f"扫描失败: {exc}"
+                    status_map[pkg_name] = (counts if ok else {}, "" if ok else err)
+                    QApplication.processEvents()
 
-        for pkg_name, pkg_dir in self._package_entries():
+        for pkg_name, pkg_dir in package_entries:
             row = QWidget()
             row_lay = QHBoxLayout(row)
             row_lay.setContentsMargins(1, 0, 1, 0)
             row_lay.setSpacing(4)
 
-            label = QLabel(pkg_name)
+            counts, err = status_map.get(pkg_name, ({}, ""))
+            label = QLabel(f"{pkg_name}{self._format_package_status_suffix(counts, err)}")
             label.setStyleSheet("font-size: 12px;")
-            label.setMinimumWidth(135)
+            label.setMinimumWidth(260)
             row_lay.addWidget(label)
 
             btn_up = QPushButton("上传")
@@ -614,7 +736,7 @@ class RepoSyncWindow(QMainWindow):
             sep.setStyleSheet("color: #5a5a62; margin: 0px; padding: 0px;")
             self.list_layout.addWidget(sep)
 
-        self._log(f"已加载 {self.list_layout.count()} 个包。")
+        self._log(f"已加载 {len(package_entries)} 个包（状态已并行扫描）。")
 
     def _ensure_git_repo(self, pkg_dir: Path) -> bool:
         if (pkg_dir / ".git").is_dir():
@@ -1674,7 +1796,10 @@ def main():
     args, _unknown = parser.parse_known_args()
     mode_map = {"server": "Server", "client": "Client"}
 
+    _set_windows_app_id()
     app = QApplication(sys.argv)
+    if APP_ICON_FILE.exists():
+        app.setWindowIcon(QIcon(str(APP_ICON_FILE)))
     win = RepoSyncWindow(mode_map.get(args.mode) or None)
     win.show()
     sys.exit(app.exec())
