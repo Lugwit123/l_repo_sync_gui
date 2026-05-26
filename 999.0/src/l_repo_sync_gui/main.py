@@ -192,7 +192,7 @@ class RepoSyncWindow(QMainWindow):
         self.log_edit.setReadOnly(True)
         self.log_edit.setMinimumHeight(180)
         self.row_buttons = []
-        self.package_entries: list[tuple[str, Path]] = []
+        self.package_entries: list[tuple[str, Path, bool]] = []
         self.package_status_labels: dict[str, QLabel] = {}
         self.btn_refresh_status: QPushButton | None = None
 
@@ -609,7 +609,8 @@ class RepoSyncWindow(QMainWindow):
             return False
         return True
 
-    def _package_entries(self) -> list[tuple[str, Path]]:
+    def _local_package_entries(self) -> list[tuple[str, Path]]:
+        """本地 rez 包目录（含 wuwo）。"""
         out: list[tuple[str, Path]] = []
         for item in sorted(self.rez_source.iterdir(), key=lambda p: p.name.lower()):
             if not item.is_dir():
@@ -620,11 +621,55 @@ class RepoSyncWindow(QMainWindow):
                 continue
             out.append((item.name, item))
 
-        # 与 repo_tools/batch_push_github.bat 一致：额外处理 trayapp/wuwo 仓库。
         wuwo_dir = self.rez_source.parent / "wuwo"
         if wuwo_dir.is_dir():
             out.append(("wuwo", wuwo_dir))
         return out
+
+    def _remote_package_path(self, name: str) -> Path:
+        if name == "wuwo":
+            return self.rez_source.parent / "wuwo"
+        return self.rez_source / name
+
+    def _fetch_remote_repo_names(self, owner: str) -> tuple[bool, list[str], str]:
+        """列出 GitHub owner 下全部仓库名。"""
+        if not self._resolve_gh_executable(from_manual=False):
+            return False, [], "gh.exe not found"
+        ok, msg = self._run(
+            ["gh", "repo", "list", owner, "--limit", "1000", "--json", "name"]
+        )
+        if not ok:
+            return False, [], msg
+        try:
+            data = json.loads(msg or "[]")
+        except json.JSONDecodeError as exc:
+            return False, [], f"解析 gh repo list 失败: {exc}"
+        if not isinstance(data, list):
+            return False, [], "gh repo list 返回格式异常"
+        names = [
+            str(item.get("name", "")).strip()
+            for item in data
+            if isinstance(item, dict) and str(item.get("name", "")).strip()
+        ]
+        return True, names, ""
+
+    def _package_entries(self) -> list[tuple[str, Path, bool]]:
+        """本地包 + 远端有但本地无的仓库。"""
+        local = self._local_package_entries()
+        local_names = {name for name, _ in local}
+        entries: list[tuple[str, Path, bool]] = [(name, path, False) for name, path in local]
+
+        owner = self.owner_edit.text().strip() or "Lugwit123"
+        ok, remote_names, err = self._fetch_remote_repo_names(owner)
+        if ok:
+            for name in sorted(set(remote_names), key=str.lower):
+                if name in local_names or name in SKIP_DIRS:
+                    continue
+                entries.append((name, self._remote_package_path(name), True))
+        elif self._resolve_gh_executable(from_manual=False):
+            self._log(f"[WARN] 获取远端仓库列表失败，仅显示本地包: {err}")
+
+        return entries
 
     @staticmethod
     def _parse_porcelain_line(line: str) -> tuple[str, str] | None:
@@ -830,10 +875,14 @@ class RepoSyncWindow(QMainWindow):
             return
         scroll = self._list_scroll_pos()
         self._log("正在刷新包 git 状态…")
-        status_map = self._scan_all_package_status(self.package_entries)
+        scannable = [(name, path) for name, path, remote_only in self.package_entries if not remote_only]
+        status_map = self._scan_all_package_status(scannable)
         self._apply_package_status_map(status_map)
         self._restore_list_scroll(scroll)
-        self._log(f"已刷新 {len(self.package_entries)} 个包的状态。")
+        local_count = sum(1 for _, _, remote_only in self.package_entries if not remote_only)
+        remote_count = len(self.package_entries) - local_count
+        extra = f"，其中 {remote_count} 个仅远端" if remote_count else ""
+        self._log(f"已刷新 {local_count} 个本地包的状态{extra}。")
 
     def refresh_packages(self):
         while self.list_layout.count():
@@ -845,16 +894,34 @@ class RepoSyncWindow(QMainWindow):
         self.package_status_labels = {}
         package_entries = self._package_entries()
         self.package_entries = package_entries
-        status_map = self._scan_all_package_status(package_entries)
+        scannable = [(name, path) for name, path, remote_only in package_entries if not remote_only]
+        status_map = self._scan_all_package_status(scannable)
+        remote_section_started = False
 
-        for pkg_name, pkg_dir in package_entries:
+        for pkg_name, pkg_dir, remote_only in package_entries:
+            if remote_only and not remote_section_started:
+                remote_section_started = True
+                section = QLabel("── 仅远端（本地无） ──")
+                section.setStyleSheet("font-size: 12px; color: #9aa0a6; padding: 4px 0px;")
+                self.list_layout.addWidget(section)
+                sep = QFrame()
+                sep.setFrameShape(QFrame.HLine)
+                sep.setFrameShadow(QFrame.Plain)
+                sep.setFixedHeight(2)
+                sep.setStyleSheet("color: #5a5a62; margin: 0px; padding: 0px;")
+                self.list_layout.addWidget(sep)
+
             row = QWidget()
             row_lay = QHBoxLayout(row)
             row_lay.setContentsMargins(1, 0, 1, 0)
             row_lay.setSpacing(4)
 
-            counts, err = status_map.get(pkg_name, ({}, ""))
-            label = QLabel(f"{pkg_name}{self._format_package_status_suffix(counts, err)}")
+            if remote_only:
+                status_text = " [仅远端]"
+            else:
+                counts, err = status_map.get(pkg_name, ({}, ""))
+                status_text = self._format_package_status_suffix(counts, err)
+            label = QLabel(f"{pkg_name}{status_text}")
             label.setStyleSheet("font-size: 12px;")
             label.setMinimumWidth(260)
             row_lay.addWidget(label)
@@ -865,7 +932,11 @@ class RepoSyncWindow(QMainWindow):
             btn_up.setStyleSheet(self._row_button_style)
             btn_up.setMinimumHeight(20)
             btn_up.setMaximumWidth(72)
-            btn_up.clicked.connect(lambda _=False, p=pkg_dir: self.upload_one(p))
+            if remote_only:
+                btn_up.setEnabled(False)
+                btn_up.setToolTip("本地尚无此仓库，请先下载")
+            else:
+                btn_up.clicked.connect(lambda _=False, p=pkg_dir: self.upload_one(p))
             row_lay.addWidget(btn_up)
             self.row_buttons.append(btn_up)
 
@@ -886,7 +957,14 @@ class RepoSyncWindow(QMainWindow):
             sep.setStyleSheet("color: #5a5a62; margin: 0px; padding: 0px;")
             self.list_layout.addWidget(sep)
 
-        self._log(f"已加载 {len(package_entries)} 个包（状态已并行扫描）。")
+        local_count = sum(1 for _, _, remote_only in package_entries if not remote_only)
+        remote_count = len(package_entries) - local_count
+        if remote_count:
+            self._log(
+                f"已加载 {local_count} 个本地包、{remote_count} 个仅远端仓库（状态已并行扫描）。"
+            )
+        else:
+            self._log(f"已加载 {local_count} 个包（状态已并行扫描）。")
 
     def _ensure_git_repo(self, pkg_dir: Path) -> bool:
         if (pkg_dir / ".git").is_dir():
@@ -1835,6 +1913,7 @@ class RepoSyncWindow(QMainWindow):
         if not self._check_tools():
             return
         self._set_busy(True)
+        cloned_new_repo = False
         try:
             self._log(f"========== 下载 {pkg_name} ==========")
             if not pkg_dir.exists():
@@ -1845,6 +1924,7 @@ class RepoSyncWindow(QMainWindow):
                 )
                 if ok_clone:
                     self._log(f"[ok] {pkg_name} cloned")
+                    cloned_new_repo = True
                 else:
                     self._log(f"[ERR] {pkg_name} clone 失败: {msg_clone}")
                     QMessageBox.warning(self, "下载失败", f"{pkg_name} clone 失败:\n{msg_clone}")
@@ -1875,18 +1955,23 @@ class RepoSyncWindow(QMainWindow):
                 QMessageBox.warning(self, "下载失败", f"{pkg_name} pull 失败:\n{msg_pull}")
         finally:
             self._set_busy(False)
-            self.refresh_package_status()
+            if cloned_new_repo:
+                self.refresh_packages()
+            else:
+                self.refresh_package_status()
 
     def upload_all(self):
         if not self._check_tools():
             return
-        for _, pkg_dir in self._package_entries():
+        for _, pkg_dir, remote_only in self._package_entries():
+            if remote_only:
+                continue
             self.upload_one(pkg_dir)
 
     def download_all(self):
         if not self._check_tools():
             return
-        for _, pkg_dir in self._package_entries():
+        for _, pkg_dir, _remote_only in self._package_entries():
             self.download_one(pkg_dir)
 
     def restart_self(self):
