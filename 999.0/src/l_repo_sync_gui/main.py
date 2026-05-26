@@ -67,6 +67,7 @@ GITHUB_FILE_WARN_BYTES = 50 * 1024 * 1024
 GITHUB_FILE_LIMIT_BYTES = 100 * 1024 * 1024
 
 SKIP_DIRS = {"repo_tools"}
+PROTECTED_LOCAL_DELETE = {"l_repo_sync_gui"}
 PREVIEW_MAX_LINES = 300
 # Git HTTPS：建立 TCP+TLS 连接阶段最长等待（秒），避免 SSL 握手长时间挂死
 GIT_HTTP_CONNECT_TIMEOUT_SEC = 5
@@ -214,7 +215,7 @@ class RepoSyncWindow(QMainWindow):
             }
             """
         )
-        self._row_button_style = "QPushButton { min-height: 20px; max-height: 20px; padding: 0px 4px; font-size: 12px; }"
+        self._row_button_style = "QPushButton { min-height: 20px; max-height: 20px; padding: 0px 4px; font-size: 11px; }"
 
     def _build_ui(self):
         root = QWidget(self)
@@ -631,6 +632,18 @@ class RepoSyncWindow(QMainWindow):
             return self.rez_source.parent / "wuwo"
         return self.rez_source / name
 
+    def _is_managed_package_dir(self, pkg_dir: Path) -> bool:
+        """限制删除范围：rez-package-source 下包目录或 wuwo。"""
+        resolved = pkg_dir.resolve()
+        wuwo_dir = (self.rez_source.parent / "wuwo").resolve()
+        if resolved == wuwo_dir:
+            return True
+        try:
+            resolved.relative_to(self.rez_source.resolve())
+            return True
+        except ValueError:
+            return False
+
     def _fetch_remote_repo_names(self, owner: str) -> tuple[bool, list[str], str]:
         """列出 GitHub owner 下全部仓库名。"""
         if not self._resolve_gh_executable(from_manual=False):
@@ -923,15 +936,15 @@ class RepoSyncWindow(QMainWindow):
                 status_text = self._format_package_status_suffix(counts, err)
             label = QLabel(f"{pkg_name}{status_text}")
             label.setStyleSheet("font-size: 12px;")
-            label.setMinimumWidth(260)
-            row_lay.addWidget(label)
+            label.setMinimumWidth(200)
+            row_lay.addWidget(label, 1)
             self.package_status_labels[pkg_name] = label
 
             btn_up = QPushButton("上传")
             btn_up.setFocusPolicy(Qt.NoFocus)
             btn_up.setStyleSheet(self._row_button_style)
             btn_up.setMinimumHeight(20)
-            btn_up.setMaximumWidth(72)
+            btn_up.setMaximumWidth(58)
             if remote_only:
                 btn_up.setEnabled(False)
                 btn_up.setToolTip("本地尚无此仓库，请先下载")
@@ -944,10 +957,35 @@ class RepoSyncWindow(QMainWindow):
             btn_down.setFocusPolicy(Qt.NoFocus)
             btn_down.setStyleSheet(self._row_button_style)
             btn_down.setMinimumHeight(20)
-            btn_down.setMaximumWidth(72)
+            btn_down.setMaximumWidth(58)
             btn_down.clicked.connect(lambda _=False, p=pkg_dir: self.download_one(p))
             row_lay.addWidget(btn_down)
             self.row_buttons.append(btn_down)
+
+            local_exists = pkg_dir.exists()
+            btn_del_local = QPushButton("删本地")
+            btn_del_local.setFocusPolicy(Qt.NoFocus)
+            btn_del_local.setStyleSheet(self._row_button_style)
+            btn_del_local.setMinimumHeight(20)
+            btn_del_local.setMaximumWidth(58)
+            if remote_only or not local_exists:
+                btn_del_local.setEnabled(False)
+                btn_del_local.setToolTip("本地目录不存在")
+            else:
+                btn_del_local.setToolTip("永久删除本地目录")
+                btn_del_local.clicked.connect(lambda _=False, p=pkg_dir: self.delete_local_one(p))
+            row_lay.addWidget(btn_del_local)
+            self.row_buttons.append(btn_del_local)
+
+            btn_del_remote = QPushButton("删远端")
+            btn_del_remote.setFocusPolicy(Qt.NoFocus)
+            btn_del_remote.setStyleSheet(self._row_button_style)
+            btn_del_remote.setMinimumHeight(20)
+            btn_del_remote.setMaximumWidth(58)
+            btn_del_remote.setToolTip("永久删除 GitHub 仓库")
+            btn_del_remote.clicked.connect(lambda _=False, p=pkg_dir: self.delete_remote_one(p))
+            row_lay.addWidget(btn_del_remote)
+            self.row_buttons.append(btn_del_remote)
 
             self.list_layout.addWidget(row)
             sep = QFrame()
@@ -1959,6 +1997,83 @@ class RepoSyncWindow(QMainWindow):
                 self.refresh_packages()
             else:
                 self.refresh_package_status()
+
+    def delete_local_one(self, pkg_dir: Path):
+        pkg_name = pkg_dir.name
+        if pkg_name in PROTECTED_LOCAL_DELETE:
+            QMessageBox.warning(
+                self,
+                "禁止删除",
+                f"不能删除当前工具包 {pkg_name} 的本地目录。",
+            )
+            return
+        if not self._is_managed_package_dir(pkg_dir):
+            QMessageBox.warning(self, "删除失败", f"不在允许删除的路径范围内：\n{pkg_dir}")
+            return
+        if not pkg_dir.exists():
+            QMessageBox.information(self, "删除本地", f"{pkg_name} 本地目录不存在。")
+            return
+
+        confirm = QMessageBox.question(
+            self,
+            "确认删除本地",
+            (
+                f"将永久删除本地目录：\n{pkg_dir}\n\n"
+                "远端 GitHub 仓库不受影响。\n"
+                "此操作不可恢复，是否继续？"
+            ),
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if confirm != QMessageBox.Yes:
+            self._log(f"[info] {pkg_name} 取消删除本地")
+            return
+
+        self._set_busy(True)
+        try:
+            self._log(f"========== 删除本地 {pkg_name} ==========")
+            shutil.rmtree(pkg_dir)
+            self._log(f"[ok] {pkg_name} 本地目录已删除: {pkg_dir}")
+        except Exception as exc:
+            self._log(f"[ERR] {pkg_name} 删除本地失败: {exc}")
+            QMessageBox.warning(self, "删除失败", f"{pkg_name} 删除本地失败:\n{exc}")
+        finally:
+            self._set_busy(False)
+            self.refresh_packages()
+
+    def delete_remote_one(self, pkg_dir: Path):
+        owner = self.owner_edit.text().strip() or "Lugwit123"
+        pkg_name = pkg_dir.name
+        if not self._check_tools():
+            return
+
+        confirm = QMessageBox.question(
+            self,
+            "确认删除远端",
+            (
+                f"将永久删除 GitHub 仓库：\n{owner}/{pkg_name}\n\n"
+                "本地目录不受影响。\n"
+                "此操作不可恢复，是否继续？"
+            ),
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if confirm != QMessageBox.Yes:
+            self._log(f"[info] {pkg_name} 取消删除远端")
+            return
+
+        self._set_busy(True)
+        try:
+            self._log(f"========== 删除远端 {pkg_name} ==========")
+            ok, msg = self._run(["gh", "repo", "delete", f"{owner}/{pkg_name}", "--yes"])
+            if ok:
+                self._log(f"[ok] {pkg_name} 远端仓库已删除: {owner}/{pkg_name}")
+            else:
+                self._log(f"[ERR] {pkg_name} 删除远端失败: {msg}")
+                QMessageBox.warning(self, "删除失败", f"{pkg_name} 删除远端失败:\n{msg}")
+        finally:
+            self._set_busy(False)
+            self.refresh_packages()
 
     def upload_all(self):
         if not self._check_tools():
