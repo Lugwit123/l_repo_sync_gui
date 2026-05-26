@@ -54,6 +54,18 @@ IGNORE_LINES = [
     "py_312/",
 ]
 
+# 按包名追加 .gitignore 规则（运行时数据、体积过大不宜 push GitHub）
+PACKAGE_EXTRA_IGNORE: dict[str, list[str]] = {
+    "l_log": [
+        "999.0/backend/logs/",
+        "999.0/backend/logs_cache/",
+        "999.0/upload_test/",
+    ],
+}
+
+GITHUB_FILE_WARN_BYTES = 50 * 1024 * 1024
+GITHUB_FILE_LIMIT_BYTES = 100 * 1024 * 1024
+
 SKIP_DIRS = {"repo_tools"}
 PREVIEW_MAX_LINES = 300
 # Git HTTPS：建立 TCP+TLS 连接阶段最长等待（秒），避免 SSL 握手长时间挂死
@@ -155,13 +167,6 @@ class RepoSyncWindow(QMainWindow):
         self.gh_token_edit = QLineEdit()
         self.gh_token_edit.setPlaceholderText("GitHub token (used by GH_TOKEN)")
         self.gh_token_edit.setEchoMode(QLineEdit.Password)
-        self.force_push_checkbox = QCheckBox("强制本地覆盖远端（--force-with-lease）")
-        self.force_push_checkbox.setToolTip("仅上传时生效。会用本地提交覆盖远端分支，请谨慎使用。")
-        self.force_download_checkbox = QCheckBox("下载时强制覆盖本地（丢弃本地修改）")
-        self.force_download_checkbox.setToolTip(
-            "下载时使用 fetch + reset --hard + clean -fd，"
-            "会丢弃本地未提交改动和未跟踪文件，请谨慎使用。"
-        )
         self.api_key_edit = QLineEdit(
             os.environ.get("SILICONFLOW_API_KEY", DEFAULT_SILICONFLOW_KEY)
         )
@@ -187,6 +192,9 @@ class RepoSyncWindow(QMainWindow):
         self.log_edit.setReadOnly(True)
         self.log_edit.setMinimumHeight(180)
         self.row_buttons = []
+        self.package_entries: list[tuple[str, Path]] = []
+        self.package_status_labels: dict[str, QLabel] = {}
+        self.btn_refresh_status: QPushButton | None = None
 
         self._apply_style()
         self._build_ui()
@@ -230,6 +238,11 @@ class RepoSyncWindow(QMainWindow):
         btn_refresh.clicked.connect(self.refresh_packages)
         owner_line.addWidget(btn_refresh)
 
+        self.btn_refresh_status = QPushButton("刷新包状态")
+        self.btn_refresh_status.setToolTip("重新扫描各包的 git 状态（修改/暂存/未跟踪等），不重建列表")
+        self.btn_refresh_status.clicked.connect(self.refresh_package_status)
+        owner_line.addWidget(self.btn_refresh_status)
+
         btn_upload_all = QPushButton("批量上传")
         btn_upload_all.clicked.connect(self.upload_all)
         owner_line.addWidget(btn_upload_all)
@@ -269,8 +282,6 @@ class RepoSyncWindow(QMainWindow):
         auth_line.addWidget(btn_gh_login)
         top_lay.addLayout(auth_line)
 
-        top_lay.addWidget(self.force_push_checkbox)
-        top_lay.addWidget(self.force_download_checkbox)
         main_layout.addWidget(top_bar)
 
         body_splitter = QSplitter(Qt.Horizontal)
@@ -286,6 +297,7 @@ class RepoSyncWindow(QMainWindow):
         left_layout.addWidget(QLabel("包列表:"))
         self.list_area = QScrollArea()
         self.list_area.setWidgetResizable(True)
+        self.list_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.list_widget = QWidget()
         self.list_layout = QVBoxLayout(self.list_widget)
         self.list_layout.setContentsMargins(0, 0, 0, 0)
@@ -467,16 +479,31 @@ class RepoSyncWindow(QMainWindow):
                 return p
         return None
 
+    def _list_scroll_pos(self) -> int:
+        bar = self.list_area.verticalScrollBar()
+        return bar.value() if bar is not None else 0
+
+    def _restore_list_scroll(self, pos: int):
+        bar = self.list_area.verticalScrollBar()
+        if bar is not None:
+            bar.setValue(pos)
+
     def _set_busy(self, busy: bool):
+        scroll = self._list_scroll_pos()
         for btn in self.row_buttons:
             btn.setEnabled(not busy)
+        if self.btn_refresh_status is not None:
+            self.btn_refresh_status.setEnabled(not busy)
         QApplication.processEvents()
+        self._restore_list_scroll(scroll)
 
     def _log(self, text: str):
+        scroll = self._list_scroll_pos()
         now = datetime.datetime.now().strftime("%H:%M:%S")
         self.log_edit.append(f"[{now}] {text}")
         self.log_edit.ensureCursorVisible()
         QApplication.processEvents()
+        self._restore_list_scroll(scroll)
 
     def _run(self, cmd: list[str], cwd: Path | None = None) -> tuple[bool, str]:
         if not cmd:
@@ -521,7 +548,9 @@ class RepoSyncWindow(QMainWindow):
                     out_b, err_b = proc.communicate(timeout=0.1)
                     break
                 except subprocess.TimeoutExpired:
+                    scroll = self._list_scroll_pos()
                     QApplication.processEvents()
+                    self._restore_list_scroll(scroll)
         except Exception as exc:
             return False, str(exc)
 
@@ -589,6 +618,21 @@ class RepoSyncWindow(QMainWindow):
         return out
 
     @staticmethod
+    def _parse_porcelain_line(line: str) -> tuple[str, str] | None:
+        """解析 git status --porcelain 单行，返回 (XY, path)。"""
+        line = (line or "").rstrip()
+        if not line:
+            return None
+        if line.startswith("?? "):
+            return "??", line[3:]
+        if len(line) < 3:
+            return line[:2], ""
+        xy = line[:2]
+        # XY 后若第 3 列是空格则为分隔符；否则 Y 为空白时路径紧跟在 index 2（如 "M wuwo.bat"）。
+        path_part = line[3:] if line[2] == " " else line[2:]
+        return xy, path_part
+
+    @staticmethod
     def _summarize_status_counts(status_lines: list[str]) -> dict[str, int]:
         counts = {
             "modified": 0,
@@ -622,6 +666,71 @@ class RepoSyncWindow(QMainWindow):
             if "R" in code_pair:
                 counts["renamed"] += 1
         return counts
+
+    def _collect_deletion_paths(self, pkg_dir: Path, status_lines: list[str]) -> list[str]:
+        """从 git status --porcelain 提取本地已删除、上传时将提交删除的路径。"""
+        paths: list[str] = []
+        for raw in status_lines:
+            parsed = self._parse_porcelain_line(raw)
+            if not parsed:
+                continue
+            xy, path_part = parsed
+            if "D" not in xy:
+                continue
+            if " -> " in path_part:
+                rel = path_part.split(" -> ", 1)[0].strip().strip('"')
+            else:
+                rel = path_part.strip().strip('"')
+            paths.append(str((pkg_dir / rel).resolve()))
+        return paths
+
+    @staticmethod
+    def _is_deletion_line(line: str) -> bool:
+        """判断预览/状态行是否表示文件删除（含 porcelain、name-status、带完整路径格式）。"""
+        stripped = (line or "").strip()
+        if not stripped or stripped.startswith("["):
+            return False
+        if "\t" in stripped:
+            return stripped.split("\t", 1)[0].strip().upper() == "D"
+        parsed = RepoSyncWindow._parse_porcelain_line(stripped)
+        if parsed:
+            xy, _ = parsed
+            return "D" in xy
+        parts = stripped.split(maxsplit=1)
+        if not parts:
+            return False
+        status_token = parts[0]
+        return len(status_token) <= 2 and "D" in status_token
+
+    def _append_pending_deletion_notice(
+        self, out: list[str], pkg_dir: Path, status_lines: list[str]
+    ) -> None:
+        deletions = self._collect_deletion_paths(pkg_dir, status_lines)
+        if not deletions:
+            return
+        out.append("")
+        out.append(
+            f"[将提交的删除] 本地已删除 {len(deletions)} 个文件，上传后将同步删除远端："
+        )
+        for path in deletions:
+            out.append(f"  D {path}")
+
+    def _append_local_pending_preview(
+        self, out: list[str], pkg_dir: Path, ok_status: bool, status_lines: list[str]
+    ) -> None:
+        local_pending = (
+            self._format_status_lines_with_full_path(pkg_dir, status_lines) if ok_status else []
+        )
+        out.append("")
+        out.append("[本地未提交改动]")
+        out.extend(local_pending or ["(无本地未提交改动)"])
+        if ok_status:
+            self._append_pending_deletion_notice(out, pkg_dir, status_lines)
+        local_diff = self._local_uncommitted_diff_lines(pkg_dir, status_lines if ok_status else [])
+        if local_diff:
+            out.append("")
+            out.append("[本地未提交改动 diff]")
+            out.extend(local_diff)
 
     def _scan_package_status(self, pkg_dir: Path) -> tuple[bool, dict[str, int], str]:
         """扫描单个包状态（给包列表统计使用，不写日志）。"""
@@ -675,6 +784,48 @@ class RepoSyncWindow(QMainWindow):
             return " [干净]"
         return f" [{' / '.join(parts)}]"
 
+    def _scan_all_package_status(
+        self,
+        package_entries: list[tuple[str, Path]],
+    ) -> dict[str, tuple[dict[str, int], str]]:
+        status_map: dict[str, tuple[dict[str, int], str]] = {}
+        if not package_entries:
+            return status_map
+        max_workers = max(1, min(8, (os.cpu_count() or 4), len(package_entries)))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(self._scan_package_status, pkg_dir): pkg_name
+                for pkg_name, pkg_dir in package_entries
+            }
+            for future in concurrent.futures.as_completed(futures):
+                pkg_name = futures[future]
+                try:
+                    ok, counts, err = future.result()
+                except Exception as exc:
+                    ok, counts, err = False, {}, f"扫描失败: {exc}"
+                status_map[pkg_name] = (counts if ok else {}, "" if ok else err)
+                QApplication.processEvents()
+        return status_map
+
+    def _apply_package_status_map(self, status_map: dict[str, tuple[dict[str, int], str]]):
+        for pkg_name, _ in self.package_entries:
+            label = self.package_status_labels.get(pkg_name)
+            if label is None:
+                continue
+            counts, err = status_map.get(pkg_name, ({}, ""))
+            label.setText(f"{pkg_name}{self._format_package_status_suffix(counts, err)}")
+
+    def refresh_package_status(self):
+        if not self.package_entries:
+            self.refresh_packages()
+            return
+        scroll = self._list_scroll_pos()
+        self._log("正在刷新包 git 状态…")
+        status_map = self._scan_all_package_status(self.package_entries)
+        self._apply_package_status_map(status_map)
+        self._restore_list_scroll(scroll)
+        self._log(f"已刷新 {len(self.package_entries)} 个包的状态。")
+
     def refresh_packages(self):
         while self.list_layout.count():
             child = self.list_layout.takeAt(0)
@@ -682,23 +833,10 @@ class RepoSyncWindow(QMainWindow):
             if w:
                 w.deleteLater()
         self.row_buttons = []
+        self.package_status_labels = {}
         package_entries = self._package_entries()
-        status_map: dict[str, tuple[dict[str, int], str]] = {}
-        max_workers = max(1, min(8, (os.cpu_count() or 4), len(package_entries) or 1))
-        if package_entries:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-                futures = {
-                    executor.submit(self._scan_package_status, pkg_dir): pkg_name
-                    for pkg_name, pkg_dir in package_entries
-                }
-                for future in concurrent.futures.as_completed(futures):
-                    pkg_name = futures[future]
-                    try:
-                        ok, counts, err = future.result()
-                    except Exception as exc:
-                        ok, counts, err = False, {}, f"扫描失败: {exc}"
-                    status_map[pkg_name] = (counts if ok else {}, "" if ok else err)
-                    QApplication.processEvents()
+        self.package_entries = package_entries
+        status_map = self._scan_all_package_status(package_entries)
 
         for pkg_name, pkg_dir in package_entries:
             row = QWidget()
@@ -711,8 +849,10 @@ class RepoSyncWindow(QMainWindow):
             label.setStyleSheet("font-size: 12px;")
             label.setMinimumWidth(260)
             row_lay.addWidget(label)
+            self.package_status_labels[pkg_name] = label
 
             btn_up = QPushButton("上传")
+            btn_up.setFocusPolicy(Qt.NoFocus)
             btn_up.setStyleSheet(self._row_button_style)
             btn_up.setMinimumHeight(20)
             btn_up.setMaximumWidth(72)
@@ -721,6 +861,7 @@ class RepoSyncWindow(QMainWindow):
             self.row_buttons.append(btn_up)
 
             btn_down = QPushButton("下载")
+            btn_down.setFocusPolicy(Qt.NoFocus)
             btn_down.setStyleSheet(self._row_button_style)
             btn_down.setMinimumHeight(20)
             btn_down.setMaximumWidth(72)
@@ -759,12 +900,96 @@ class RepoSyncWindow(QMainWindow):
             }
         lines = list(existing)
         changed = False
-        for line in IGNORE_LINES:
+        extra = PACKAGE_EXTRA_IGNORE.get(pkg_dir.name, [])
+        for line in [*IGNORE_LINES, *extra]:
             if line not in existing:
                 lines.append(line)
                 changed = True
         if changed:
             path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    def _find_oversized_push_blobs(
+        self, pkg_dir: Path, upstream_ref: str | None = None
+    ) -> list[tuple[str, int]]:
+        """列出即将 push 的提交中超过 GitHub 限制（100MB）的 blob。"""
+        git_exe = self._resolve_git_executable()
+        if not git_exe:
+            return []
+        rev_range = f"{upstream_ref}..HEAD" if upstream_ref else "HEAD"
+        try:
+            rev_proc = subprocess.run(
+                [git_exe, "rev-list", "--objects", rev_range],
+                cwd=str(pkg_dir),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=120,
+                check=False,
+            )
+            if rev_proc.returncode != 0 or not (rev_proc.stdout or "").strip():
+                return []
+            cat_proc = subprocess.run(
+                [
+                    git_exe,
+                    "cat-file",
+                    "--batch-check=%(objecttype) %(objectname) %(objectsize) %(rest)",
+                ],
+                cwd=str(pkg_dir),
+                input=rev_proc.stdout,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=120,
+                check=False,
+            )
+        except Exception as exc:
+            self._log(f"[WARN] 扫描大文件失败: {exc}")
+            return []
+        if cat_proc.returncode != 0:
+            return []
+        oversized: list[tuple[str, int]] = []
+        for line in (cat_proc.stdout or "").splitlines():
+            parts = line.split(maxsplit=3)
+            if len(parts) < 4 or parts[0] != "blob":
+                continue
+            try:
+                size = int(parts[2])
+            except ValueError:
+                continue
+            if size >= GITHUB_FILE_LIMIT_BYTES:
+                oversized.append((parts[3], size))
+        oversized.sort(key=lambda x: x[1], reverse=True)
+        return oversized
+
+    @staticmethod
+    def _format_bytes(num: int) -> str:
+        if num >= 1024 * 1024:
+            return f"{num / (1024 * 1024):.2f} MB"
+        if num >= 1024:
+            return f"{num / 1024:.1f} KB"
+        return f"{num} B"
+
+    def _confirm_push_with_oversized_files(
+        self, pkg_name: str, oversized: list[tuple[str, int]]
+    ) -> bool:
+        lines = [
+            f"{path} ({self._format_bytes(size)})"
+            for path, size in oversized[:20]
+        ]
+        if len(oversized) > 20:
+            lines.append(f"...(共 {len(oversized)} 个超限文件)")
+        body = (
+            f"{pkg_name} 即将 push 的提交中含有超过 GitHub 100MB 硬限制的文件，"
+            "推送必然失败。\n\n"
+            "请将这些路径加入 .gitignore，并用 git rm --cached 从版本库移除后重新提交。\n\n"
+            + "\n".join(lines)
+        )
+        QMessageBox.critical(self, "无法推送：文件过大", body)
+        return False
 
     def _ensure_remote(self, pkg_dir: Path, pkg_name: str, owner: str):
         remote_url = f"https://github.com/{owner}/{pkg_name}.git"
@@ -778,6 +1003,49 @@ class RepoSyncWindow(QMainWindow):
         ok, msg = self._run(["git", "branch", "--show-current"], cwd=pkg_dir)
         branch = (msg or "").strip().splitlines()[-1] if ok and msg.strip() else "main"
         return branch or "main"
+
+    def _has_git_remote(self, pkg_dir: Path, name: str = "origin") -> bool:
+        ok, _ = self._run(["git", "remote", "get-url", name], cwd=pkg_dir)
+        return ok
+
+    def _try_create_github_repo_and_push(
+        self, pkg_dir: Path, pkg_name: str, owner: str, branch: str
+    ) -> bool:
+        """远端仓库不存在时：gh repo create 后 push（兼容本地已有 origin）。"""
+        ok_create, msg_create = self._run(
+            ["gh", "repo", "create", f"{owner}/{pkg_name}", "--public"],
+            cwd=pkg_dir,
+        )
+        if not ok_create:
+            low = (msg_create or "").lower()
+            if "already exists" not in low and "name already exists" not in low:
+                self._log(f"[ERR] {pkg_name} gh repo create 失败: {msg_create}")
+                QMessageBox.warning(
+                    self,
+                    "上传失败",
+                    f"{pkg_name} 创建远端仓库失败:\n{msg_create}",
+                )
+                return False
+            self._log(f"[warn] {pkg_name} 远端仓库已存在，继续 push")
+
+        if not self._has_git_remote(pkg_dir):
+            remote_url = f"https://github.com/{owner}/{pkg_name}.git"
+            self._run(["git", "remote", "add", "origin", remote_url], cwd=pkg_dir)
+
+        ok_push, msg_push = self._run(
+            ["git", "push", "-u", "origin", branch], cwd=pkg_dir
+        )
+        if ok_push:
+            self._log(f"[ok] {pkg_name} created and pushed")
+            return True
+
+        self._log(f"[ERR] {pkg_name} 建仓后 push 失败: {msg_push}")
+        QMessageBox.warning(
+            self,
+            "上传失败",
+            f"{pkg_name} 远端仓库已创建，但 push 失败:\n{msg_push}",
+        )
+        return False
 
     @staticmethod
     def _should_try_create_repo(push_err: str) -> bool:
@@ -825,6 +1093,76 @@ class RepoSyncWindow(QMainWindow):
         ]
         return any(m in low for m in markers)
 
+    def _ask_force_push(self, pkg_name: str, branch: str, reason: str) -> bool:
+        """push 失败时询问是否强制覆盖远端。"""
+        confirm = QMessageBox.question(
+            self,
+            "上传冲突",
+            (
+                f"{pkg_name} 推送失败：\n{reason}\n\n"
+                f"是否强制用本地覆盖远端？\n"
+                f"git push -u origin {branch} --force-with-lease\n\n"
+                "这会丢弃远端同分支上未合并的提交，请谨慎确认。"
+            ),
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        return confirm == QMessageBox.Yes
+
+    def _ask_force_download(self, pkg_name: str, reason: str) -> bool:
+        """pull 失败时询问是否强制覆盖本地。"""
+        confirm = QMessageBox.question(
+            self,
+            "下载冲突",
+            (
+                f"{pkg_name} 下载失败：\n{reason}\n\n"
+                "是否强制用远端覆盖本地？将执行：\n"
+                "1) git fetch --all --prune\n"
+                "2) git reset --hard <upstream>\n"
+                "3) git clean -fd\n\n"
+                "这会丢弃本地未提交改动和未跟踪文件，请谨慎确认。"
+            ),
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        return confirm == QMessageBox.Yes
+
+    def _force_download_workspace(self, pkg_dir: Path, pkg_name: str) -> bool:
+        """fetch + reset --hard + clean -fd 强制同步远端到本地。"""
+        ok_fetch, msg_fetch = self._run(["git", "fetch", "--all", "--prune"], cwd=pkg_dir)
+        if not ok_fetch:
+            self._log(f"[ERR] {pkg_name} fetch 失败: {msg_fetch}")
+            QMessageBox.warning(self, "下载失败", f"{pkg_name} fetch 失败:\n{msg_fetch}")
+            return False
+
+        ok_up, upstream = self._run(
+            ["git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"], cwd=pkg_dir
+        )
+        if ok_up and upstream.strip():
+            target_ref = upstream.strip().splitlines()[-1]
+        else:
+            target_ref = f"origin/{self._current_branch(pkg_dir)}"
+            self._log(f"[warn] {pkg_name} 无上游分支，回退使用 {target_ref}")
+
+        ok_reset, msg_reset = self._run(["git", "reset", "--hard", target_ref], cwd=pkg_dir)
+        if not ok_reset:
+            self._log(f"[ERR] {pkg_name} reset --hard 失败: {msg_reset}")
+            QMessageBox.warning(
+                self,
+                "下载失败",
+                f"{pkg_name} reset --hard {target_ref} 失败:\n{msg_reset}",
+            )
+            return False
+
+        ok_clean, msg_clean = self._run(["git", "clean", "-fd"], cwd=pkg_dir)
+        if not ok_clean:
+            self._log(f"[ERR] {pkg_name} clean -fd 失败: {msg_clean}")
+            QMessageBox.warning(self, "下载失败", f"{pkg_name} clean -fd 失败:\n{msg_clean}")
+            return False
+
+        self._log(f"[ok] {pkg_name} 强制下载完成（已覆盖本地）")
+        return True
+
     def _clip_lines(self, lines: list[str], limit: int = PREVIEW_MAX_LINES) -> list[str]:
         clipped = [x for x in lines if x is not None]
         if len(clipped) > limit:
@@ -840,15 +1178,28 @@ class RepoSyncWindow(QMainWindow):
         clipped = self._clip_lines(preview)
 
         summary = []
+        deletion_summary: list[str] = []
         for line in clipped:
-            if line.startswith(" A ") or line.startswith("A "):
+            if self._is_deletion_line(line):
+                deletion_summary.append(line.strip())
+                continue
+            stripped = line.strip()
+            if not stripped or stripped.startswith("["):
+                continue
+            if stripped.startswith("?? "):
                 summary.append(line)
-            elif line.startswith(" M ") or line.startswith("M "):
-                summary.append(line)
-            elif line.startswith(" D ") or line.startswith("D "):
+                continue
+            if "\t" in stripped:
+                code = stripped.split("\t", 1)[0].strip().upper()
+                if code in ("A", "M", "D", "R", "C"):
+                    summary.append(line)
+                continue
+            parts = stripped.split(maxsplit=1)
+            if parts and len(parts[0]) <= 2 and any(c in parts[0] for c in "MADRC"):
                 summary.append(line)
         summary = summary[:25]
         summary_text = "\n".join(summary) if summary else "(见详细变更)"
+        deletion_count = len(deletion_summary)
 
         dlg = QDialog(self)
         dlg.setWindowTitle(title)
@@ -856,16 +1207,31 @@ class RepoSyncWindow(QMainWindow):
         dlg.setMinimumSize(860, 620)
         layout = QVBoxLayout(dlg)
 
-        info = QLabel(
-            f"{pkg_name} 将执行文件同步。"
-            "\n下方按标签页显示完整预览（含完整路径与 diff）。是否继续？"
-        )
+        info_lines = [f"{pkg_name} 将执行文件同步。"]
+        if deletion_count:
+            info_lines.append(
+                f"\n⚠ 注意：有 {deletion_count} 个本地已删除的文件将一并提交，远端对应文件也会被删除。"
+            )
+        info_lines.append("\n下方按标签页显示完整预览（含完整路径与 diff）。是否继续？")
+        info = QLabel("".join(info_lines))
         info.setWordWrap(True)
+        if deletion_count:
+            info.setStyleSheet("color: #b45309; font-weight: bold;")
         layout.addWidget(info)
 
+        if deletion_count:
+            shown = "\n".join(deletion_summary[:15])
+            if deletion_count > 15:
+                shown += f"\n...(共 {deletion_count} 个删除，见总览)"
+            blocks = [f"⚠ 将删除的文件 ({deletion_count}):\n{shown}"]
+            if summary:
+                blocks.append(f"关键文件变更（新增/修改/删除）:\n{summary_text}")
+            summary_plain = "\n\n".join(blocks)
+        else:
+            summary_plain = f"关键文件变更（新增/修改/删除）:\n{summary_text}"
         summary_box = QTextEdit(dlg)
         summary_box.setReadOnly(True)
-        summary_box.setPlainText(f"关键文件变更（新增/修改/删除）:\n{summary_text}")
+        summary_box.setPlainText(summary_plain)
         summary_box.setMinimumHeight(120)
         summary_box.setMaximumHeight(500)
         layout.addWidget(summary_box)
@@ -893,7 +1259,6 @@ class RepoSyncWindow(QMainWindow):
 
         ai_detail_edit: QTextEdit | None = None
         ai_use_as_commit = None
-        dialog_force_push = None
         if enable_ai:
             ai_panel = QWidget(dlg)
             ai_panel_lay = QVBoxLayout(ai_panel)
@@ -938,10 +1303,6 @@ class RepoSyncWindow(QMainWindow):
             ai_use_as_commit = QCheckBox("提交时使用 AI 详情作为 commit message")
             ai_use_as_commit.setChecked(True)
             ai_panel_lay.addWidget(ai_use_as_commit)
-
-            dialog_force_push = QCheckBox("本次上传使用强制推送（--force-with-lease）")
-            dialog_force_push.setChecked(self.force_push_checkbox.isChecked())
-            ai_panel_lay.addWidget(dialog_force_push)
 
             stream_bridge = _AiStreamBridge()
             current_ai_text = {"text": ""}
@@ -1023,10 +1384,9 @@ class RepoSyncWindow(QMainWindow):
         btn_row.addWidget(btn_yes)
         btn_row.addWidget(btn_no)
         layout.addLayout(btn_row)
+        list_scroll = self._list_scroll_pos()
         accepted = dlg.exec() == QDialog.Accepted
-        if accepted and enable_ai and dialog_force_push is not None:
-            # 与主界面保持一致，便于后续 push 逻辑复用现有开关。
-            self.force_push_checkbox.setChecked(dialog_force_push.isChecked())
+        self._restore_list_scroll(list_scroll)
         commit_msg_from_ai = None
         if (
             accepted
@@ -1192,18 +1552,10 @@ class RepoSyncWindow(QMainWindow):
         )
         out: list[str] = []
         ok_status, status_lines = self._status_lines(pkg_dir)
-        local_pending = self._format_status_lines_with_full_path(pkg_dir, status_lines) if ok_status else []
 
         if not ok_up or not upstream.strip():
             out.append("[远端差异预览] 无上游分支，推送时将按当前分支创建/关联远端。")
-            out.append("")
-            out.append("[本地未提交改动]")
-            out.extend(local_pending or ["(无本地未提交改动)"])
-            local_diff = self._local_uncommitted_diff_lines(pkg_dir, status_lines if ok_status else [])
-            if local_diff:
-                out.append("")
-                out.append("[本地未提交改动 diff]")
-                out.extend(local_diff)
+            self._append_local_pending_preview(out, pkg_dir, ok_status, status_lines)
             return out
 
         upstream_ref = upstream.strip().splitlines()[-1]
@@ -1214,14 +1566,7 @@ class RepoSyncWindow(QMainWindow):
         )
         if not ok_name:
             out.append(f"[远端差异预览] 获取失败: {msg_name}")
-            out.append("")
-            out.append("[本地未提交改动]")
-            out.extend(local_pending or ["(无本地未提交改动)"])
-            local_diff = self._local_uncommitted_diff_lines(pkg_dir, status_lines if ok_status else [])
-            if local_diff:
-                out.append("")
-                out.append("[本地未提交改动 diff]")
-                out.extend(local_diff)
+            self._append_local_pending_preview(out, pkg_dir, ok_status, status_lines)
             return out
 
         lines = [line for line in (msg_name or "").splitlines() if line.strip()]
@@ -1234,25 +1579,18 @@ class RepoSyncWindow(QMainWindow):
                 "将推送到远端的提交差异 diff",
             )
         )
-        out.append("")
-        out.append("[本地未提交改动]")
-        out.extend(local_pending or ["(无本地未提交改动)"])
-        local_diff = self._local_uncommitted_diff_lines(pkg_dir, status_lines if ok_status else [])
-        if local_diff:
-            out.append("")
-            out.append("[本地未提交改动 diff]")
-            out.extend(local_diff)
+        self._append_local_pending_preview(out, pkg_dir, ok_status, status_lines)
         return out
 
     def _format_status_lines_with_full_path(self, pkg_dir: Path, status_lines: list[str]) -> list[str]:
         """将 git status --porcelain 输出转换为带完整路径的可读行。"""
         out: list[str] = []
         for raw in status_lines:
-            line = raw.rstrip()
-            if not line:
+            parsed = self._parse_porcelain_line(raw)
+            if not parsed:
                 continue
-            status = line[:2].strip() or "?"
-            path_part = line[3:] if len(line) > 3 else ""
+            status_raw, path_part = parsed
+            status = status_raw.strip() or "?"
 
             if " -> " in path_part:
                 old_rel, new_rel = path_part.split(" -> ", 1)
@@ -1280,10 +1618,10 @@ class RepoSyncWindow(QMainWindow):
             out.extend(["[已暂存改动 diff]", msg_staged.strip(), ""])
 
         for raw in status_lines:
-            line = (raw or "").rstrip()
-            if not line.startswith("?? "):
+            parsed = self._parse_porcelain_line(raw)
+            if not parsed or parsed[0] != "??":
                 continue
-            rel = line[3:].strip()
+            rel = parsed[1].strip()
             if rel.startswith('"') and rel.endswith('"') and len(rel) >= 2:
                 rel = rel[1:-1]
             file_path = (pkg_dir / rel).resolve()
@@ -1362,6 +1700,18 @@ class RepoSyncWindow(QMainWindow):
                 return
             branch = self._current_branch(pkg_dir)
 
+            ok_status, status_lines = self._status_lines(pkg_dir)
+            pending_deletions = (
+                self._collect_deletion_paths(pkg_dir, status_lines) if ok_status else []
+            )
+            if pending_deletions:
+                sample = ", ".join(pending_deletions[:3])
+                if len(pending_deletions) > 3:
+                    sample += " ..."
+                self._log(
+                    f"[info] {pkg_name} 将提交 {len(pending_deletions)} 个文件删除: {sample}"
+                )
+
             self._run(["git", "add", "-A"], cwd=pkg_dir)
             ok, _ = self._run(["git", "diff", "--cached", "--quiet"], cwd=pkg_dir)
             if not ok:
@@ -1391,62 +1741,52 @@ class RepoSyncWindow(QMainWindow):
             else:
                 self._log(f"[info] {pkg_name} no changes to commit")
 
-            push_cmd = ["git", "push", "-u", "origin", branch]
-            if self.force_push_checkbox.isChecked():
-                confirm = QMessageBox.question(
-                    self,
-                    "二次确认强制覆盖",
-                    (
-                        f"{pkg_name} 将执行强制推送：\n"
-                        f"git push -u origin {branch} --force-with-lease\n\n"
-                        "这会用本地提交覆盖远端同分支历史，是否继续？"
-                    ),
-                    QMessageBox.Yes | QMessageBox.No,
-                    QMessageBox.No,
+            upstream_push_ref: str | None = None
+            ok_up, upstream_msg = self._run(
+                ["git", "rev-parse", "--verify", f"origin/{branch}"], cwd=pkg_dir
+            )
+            if ok_up and (upstream_msg or "").strip():
+                upstream_push_ref = (upstream_msg or "").strip().splitlines()[-1]
+            oversized = self._find_oversized_push_blobs(pkg_dir, upstream_push_ref)
+            if oversized:
+                self._log(
+                    f"[ERR] {pkg_name} push 前检测到大文件: "
+                    + ", ".join(f"{p} ({self._format_bytes(s)})" for p, s in oversized[:5])
                 )
-                if confirm != QMessageBox.Yes:
-                    self._log(f"[info] {pkg_name} 取消强制上传")
-                    return
-                push_cmd.append("--force-with-lease")
-                self._log(f"[warn] {pkg_name} 已启用强制覆盖远端")
+                self._confirm_push_with_oversized_files(pkg_name, oversized)
+                return
 
+            push_cmd = ["git", "push", "-u", "origin", branch]
             ok_push, msg_push = self._run(push_cmd, cwd=pkg_dir)
             if ok_push:
                 self._log(f"[ok] {pkg_name} pushed")
                 return
 
-            if not self.force_push_checkbox.isChecked() and self._is_non_fast_forward_error(msg_push):
-                self._log(f"[warn] {pkg_name} push 被远端拒绝，尝试自动 pull --rebase 后重试")
-                ok_pull_rebase, msg_pull_rebase = self._run(
-                    ["git", "pull", "--rebase", "--autostash", "origin", branch], cwd=pkg_dir
-                )
-                if ok_pull_rebase:
-                    self._log(f"[ok] {pkg_name} pull --rebase 成功，开始重试 push")
-                    ok_push_retry, msg_push_retry = self._run(push_cmd, cwd=pkg_dir)
-                    if ok_push_retry:
-                        self._log(f"[ok] {pkg_name} pushed（自动重试成功）")
+            if self._is_non_fast_forward_error(msg_push):
+                self._log(f"[warn] {pkg_name} push 被远端拒绝: {msg_push}")
+                if self._ask_force_push(pkg_name, branch, msg_push):
+                    oversized = self._find_oversized_push_blobs(pkg_dir, upstream_push_ref)
+                    if oversized:
+                        self._log(
+                            f"[ERR] {pkg_name} 强制推送仍会因大文件失败: "
+                            + ", ".join(f"{p} ({self._format_bytes(s)})" for p, s in oversized[:5])
+                        )
+                        self._confirm_push_with_oversized_files(pkg_name, oversized)
                         return
-                    self._log(f"[ERR] {pkg_name} 重试 push 失败: {msg_push_retry}")
+                    force_cmd = push_cmd + ["--force-with-lease"]
+                    self._log(f"[warn] {pkg_name} 用户确认强制覆盖远端")
+                    ok_force, msg_force = self._run(force_cmd, cwd=pkg_dir)
+                    if ok_force:
+                        self._log(f"[ok] {pkg_name} 强制推送成功")
+                        return
+                    self._log(f"[ERR] {pkg_name} 强制推送失败: {msg_force}")
                     QMessageBox.warning(
                         self,
                         "上传失败",
-                        (
-                            f"{pkg_name} push 被远端拒绝，已自动 pull --rebase 并重试，但仍失败。\n\n"
-                            f"pull --rebase 输出:\n{msg_pull_rebase}\n\n"
-                            f"push 重试输出:\n{msg_push_retry}"
-                        ),
+                        f"{pkg_name} 强制推送失败:\n{msg_force}",
                     )
-                    return
-                self._log(f"[ERR] {pkg_name} 自动 pull --rebase 失败: {msg_pull_rebase}")
-                QMessageBox.warning(
-                    self,
-                    "上传失败",
-                    (
-                        f"{pkg_name} push 被远端拒绝（non-fast-forward），自动 pull --rebase 失败。\n"
-                        "请先处理 rebase 冲突或手动同步后再推送。\n\n"
-                        f"详情:\n{msg_pull_rebase}"
-                    ),
-                )
+                else:
+                    self._log(f"[info] {pkg_name} 用户取消强制上传")
                 return
 
             if not self._should_try_create_repo(msg_push):
@@ -1475,28 +1815,10 @@ class RepoSyncWindow(QMainWindow):
                     ),
                 )
                 return
-            ok_create, msg_create = self._run(
-                [
-                    "gh",
-                    "repo",
-                    "create",
-                    f"{owner}/{pkg_name}",
-                    "--public",
-                    "--source",
-                    ".",
-                    "--remote",
-                    "origin",
-                    "--push",
-                ],
-                cwd=pkg_dir,
-            )
-            if ok_create:
-                self._log(f"[ok] {pkg_name} created and pushed")
-            else:
-                self._log(f"[ERR] {pkg_name} 上传失败: {msg_create}")
-                QMessageBox.warning(self, "上传失败", f"{pkg_name} 上传失败:\n{msg_create}")
+            self._try_create_github_repo_and_push(pkg_dir, pkg_name, owner, branch)
         finally:
             self._set_busy(False)
+            self.refresh_package_status()
 
     def download_one(self, pkg_dir: Path):
         owner = self.owner_edit.text().strip() or "Lugwit123"
@@ -1530,66 +1852,20 @@ class RepoSyncWindow(QMainWindow):
             if not confirmed:
                 self._log(f"[info] {pkg_name} 取消下载")
                 return
-            if self.force_download_checkbox.isChecked():
-                confirm = QMessageBox.question(
-                    self,
-                    "二次确认强制下载",
-                    (
-                        f"{pkg_name} 将强制覆盖本地工作区：\n"
-                        "1) git fetch --all --prune\n"
-                        "2) git reset --hard <upstream>\n"
-                        "3) git clean -fd\n\n"
-                        "这会丢弃本地未提交改动和未跟踪文件，是否继续？"
-                    ),
-                    QMessageBox.Yes | QMessageBox.No,
-                    QMessageBox.No,
-                )
-                if confirm != QMessageBox.Yes:
-                    self._log(f"[info] {pkg_name} 取消强制下载")
-                    return
-
-                ok_fetch, msg_fetch = self._run(["git", "fetch", "--all", "--prune"], cwd=pkg_dir)
-                if not ok_fetch:
-                    self._log(f"[ERR] {pkg_name} fetch 失败: {msg_fetch}")
-                    QMessageBox.warning(self, "下载失败", f"{pkg_name} fetch 失败:\n{msg_fetch}")
-                    return
-
-                ok_up, upstream = self._run(
-                    ["git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"], cwd=pkg_dir
-                )
-                if ok_up and upstream.strip():
-                    target_ref = upstream.strip().splitlines()[-1]
-                else:
-                    target_ref = f"origin/{self._current_branch(pkg_dir)}"
-                    self._log(f"[warn] {pkg_name} 无上游分支，回退使用 {target_ref}")
-
-                ok_reset, msg_reset = self._run(["git", "reset", "--hard", target_ref], cwd=pkg_dir)
-                if not ok_reset:
-                    self._log(f"[ERR] {pkg_name} reset --hard 失败: {msg_reset}")
-                    QMessageBox.warning(
-                        self,
-                        "下载失败",
-                        f"{pkg_name} reset --hard {target_ref} 失败:\n{msg_reset}",
-                    )
-                    return
-
-                ok_clean, msg_clean = self._run(["git", "clean", "-fd"], cwd=pkg_dir)
-                if not ok_clean:
-                    self._log(f"[ERR] {pkg_name} clean -fd 失败: {msg_clean}")
-                    QMessageBox.warning(self, "下载失败", f"{pkg_name} clean -fd 失败:\n{msg_clean}")
-                    return
-
-                self._log(f"[ok] {pkg_name} 强制下载完成（已覆盖本地）")
-                return
-
             ok_pull, msg_pull = self._run(["git", "pull", "--ff-only"], cwd=pkg_dir)
             if ok_pull:
                 self._log(f"[ok] {pkg_name} pulled")
+                return
+
+            self._log(f"[warn] {pkg_name} pull --ff-only 失败: {msg_pull}")
+            if self._ask_force_download(pkg_name, msg_pull):
+                self._force_download_workspace(pkg_dir, pkg_name)
             else:
-                self._log(f"[ERR] {pkg_name} pull 失败: {msg_pull}")
+                self._log(f"[info] {pkg_name} 用户取消强制下载")
                 QMessageBox.warning(self, "下载失败", f"{pkg_name} pull 失败:\n{msg_pull}")
         finally:
             self._set_busy(False)
+            self.refresh_package_status()
 
     def upload_all(self):
         if not self._check_tools():
