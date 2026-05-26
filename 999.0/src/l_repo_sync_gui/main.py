@@ -505,7 +505,21 @@ class RepoSyncWindow(QMainWindow):
         QApplication.processEvents()
         self._restore_list_scroll(scroll)
 
-    def _run(self, cmd: list[str], cwd: Path | None = None) -> tuple[bool, str]:
+    @staticmethod
+    def _git_config_prefix(repo_dir: Path | None = None) -> list[str]:
+        """git 单次调用参数：不写入全局 gitconfig。"""
+        args = ["-c", f"http.connectTimeout={GIT_HTTP_CONNECT_TIMEOUT_SEC}"]
+        if repo_dir is not None:
+            safe_path = str(repo_dir.resolve()).replace("\\", "/")
+            args.extend(["-c", f"safe.directory={safe_path}"])
+        return args
+
+    def _run(
+        self,
+        cmd: list[str],
+        cwd: Path | None = None,
+        safe_dir: Path | None = None,
+    ) -> tuple[bool, str]:
         if not cmd:
             return False, "empty command"
 
@@ -514,13 +528,8 @@ class RepoSyncWindow(QMainWindow):
             git_exe = self._resolve_git_executable()
             if not git_exe:
                 return False, "git.exe not found"
-            # 不修改全局 gitconfig，仅本次进程内生效
-            effective_cmd = [
-                git_exe,
-                "-c",
-                f"http.connectTimeout={GIT_HTTP_CONNECT_TIMEOUT_SEC}",
-                *cmd[1:],
-            ]
+            repo_safe = safe_dir if safe_dir is not None else cwd
+            effective_cmd = [git_exe, *self._git_config_prefix(repo_safe), *cmd[1:]]
         elif cmd[0] == "gh":
             gh_exe = self._resolve_gh_executable()
             if not gh_exe:
@@ -741,7 +750,7 @@ class RepoSyncWindow(QMainWindow):
             return False, {}, "未找到git.exe"
         try:
             proc = subprocess.run(
-                [git_exe, "status", "--porcelain"],
+                [git_exe, *self._git_config_prefix(pkg_dir), "status", "--porcelain"],
                 cwd=str(pkg_dir),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -1831,7 +1840,8 @@ class RepoSyncWindow(QMainWindow):
             if not pkg_dir.exists():
                 pkg_dir.parent.mkdir(parents=True, exist_ok=True)
                 ok_clone, msg_clone = self._run(
-                    ["git", "clone", f"https://github.com/{owner}/{pkg_name}.git", str(pkg_dir)]
+                    ["git", "clone", f"https://github.com/{owner}/{pkg_name}.git", str(pkg_dir)],
+                    safe_dir=pkg_dir,
                 )
                 if ok_clone:
                     self._log(f"[ok] {pkg_name} cloned")
