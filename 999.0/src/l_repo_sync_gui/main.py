@@ -6,6 +6,7 @@ import difflib
 import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import threading
@@ -112,6 +113,10 @@ def _set_windows_app_id():
 
 
 class _AiBridge(QObject):
+    finished = Signal(bool, str)
+
+
+class _NetTestBridge(QObject):
     finished = Signal(bool, str)
 
 
@@ -278,6 +283,15 @@ class RepoSyncWindow(QMainWindow):
         btn_auth_status = QPushButton("检查授权")
         btn_auth_status.clicked.connect(self._check_github_auth)
         auth_line.addWidget(btn_auth_status)
+        self.btn_test_network = QPushButton("测试网络连接")
+        self.btn_test_network.setToolTip(
+            "检测 github.com:443 与 Git HTTPS（ls-remote），用于排查 push/fetch 失败"
+        )
+        self.btn_test_network.clicked.connect(self._test_network_connection)
+        auth_line.addWidget(self.btn_test_network)
+        self._net_test_bridge = _NetTestBridge()
+        self._net_test_bridge.finished.connect(self._on_network_test_finished)
+        self._net_test_running = False
         btn_gh_login = QPushButton("网页登录授权")
         btn_gh_login.clicked.connect(self._start_gh_auth_login)
         auth_line.addWidget(btn_gh_login)
@@ -410,6 +424,176 @@ class RepoSyncWindow(QMainWindow):
         else:
             QMessageBox.warning(self, "GitHub 授权状态", msg or "未授权。")
 
+    @staticmethod
+    def _probe_tcp(host: str, port: int, timeout_sec: float) -> tuple[bool, int, str]:
+        start = time.perf_counter()
+        try:
+            with socket.create_connection((host, port), timeout=timeout_sec):
+                pass
+            return True, int((time.perf_counter() - start) * 1000), ""
+        except OSError as exc:
+            return False, int((time.perf_counter() - start) * 1000), str(exc)
+
+    def _collect_proxy_info(self) -> list[str]:
+        lines: list[str] = []
+        for key in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"):
+            val = (os.environ.get(key) or "").strip()
+            if val:
+                lines.append(f"  {key}={val}")
+        if not lines:
+            lines.append("  (未设置 HTTP/HTTPS/ALL_PROXY 环境变量)")
+        git_exe = self._resolve_git_executable()
+        if git_exe:
+            for cfg in ("http.proxy", "https.proxy"):
+                proc = subprocess.run(
+                    [git_exe, "config", "--global", "--get", cfg],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=5,
+                    check=False,
+                )
+                val = (proc.stdout or "").strip()
+                if proc.returncode == 0 and val:
+                    lines.append(f"  git global {cfg}={val}")
+        return lines
+
+    @staticmethod
+    def _is_transient_git_ssl_error(msg: str) -> bool:
+        low = (msg or "").lower()
+        return any(
+            m in low
+            for m in (
+                "ssl_error_syscall",
+                "ssl_read",
+                "connection reset",
+                "connection aborted",
+                "eof",
+            )
+        )
+
+    def _probe_git_ls_remote_once(
+        self, repo_url: str, timeout_sec: int = 30
+    ) -> tuple[bool, int, str]:
+        git_exe = self._resolve_git_executable()
+        if not git_exe:
+            return False, 0, "未找到 git.exe"
+        cmd = [
+            git_exe,
+            *self._git_config_prefix(),
+            "ls-remote",
+            repo_url,
+            "HEAD",
+        ]
+        env = os.environ.copy()
+        env["GIT_HTTP_CONNECT_TIMEOUT"] = str(GIT_HTTP_CONNECT_TIMEOUT_SEC)
+        start = time.perf_counter()
+        try:
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=timeout_sec,
+                env=env,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            return False, timeout_sec * 1000, f"超时 ({timeout_sec}s)"
+        except Exception as exc:
+            return False, int((time.perf_counter() - start) * 1000), str(exc)
+        ms = int((time.perf_counter() - start) * 1000)
+        merged = "\n".join(
+            x for x in [(proc.stdout or "").strip(), (proc.stderr or "").strip()] if x
+        )
+        if proc.returncode != 0:
+            return False, ms, merged or f"exit code={proc.returncode}"
+        head = (proc.stdout or "").strip().splitlines()[0] if proc.stdout else ""
+        return True, ms, head or "(empty)"
+
+    def _probe_git_ls_remote(
+        self, repo_url: str, timeout_sec: int = 30, retries: int = 3
+    ) -> tuple[bool, int, str, int]:
+        """探测 Git HTTPS；返回 (ok, ms, detail, attempts)。"""
+        last_ms = 0
+        last_detail = ""
+        attempts = 0
+        for attempt in range(retries):
+            attempts = attempt + 1
+            if attempt > 0:
+                time.sleep(1.0)
+            ok, last_ms, last_detail = self._probe_git_ls_remote_once(
+                repo_url, timeout_sec
+            )
+            if ok:
+                if attempt > 0:
+                    return True, last_ms, f"(第{attempts}次成功) {last_detail}", attempts
+                return True, last_ms, last_detail, attempts
+            if attempt + 1 >= retries or not self._is_transient_git_ssl_error(
+                last_detail
+            ):
+                break
+        return False, last_ms, last_detail, attempts
+
+    def _test_network_connection(self):
+        if self._net_test_running:
+            return
+        if not self._resolve_git_executable():
+            QMessageBox.warning(self, "网络测试", "未找到 git.exe，请先设置路径。")
+            return
+        self._net_test_running = True
+        self.btn_test_network.setEnabled(False)
+        owner = self.owner_edit.text().strip() or "Lugwit123"
+        self._log("========== 测试网络连接 ==========")
+
+        def _worker():
+            lines = ["[代理配置]", *self._collect_proxy_info(), ""]
+            ok_tcp, ms_tcp, err_tcp = self._probe_tcp("github.com", 443, 5.0)
+            lines.append(
+                f"[TCP] github.com:443 -> {'OK' if ok_tcp else 'FAIL'} ({ms_tcp} ms)"
+            )
+            if err_tcp:
+                lines.append(f"  {err_tcp}")
+            lines.append("[Git] 使用 http.version=HTTP/1.1（降低 SSL_ERROR_SYSCALL 概率）")
+            lines.append("")
+            git_ok = True
+            for idx, pkg in enumerate(("l_WChat", "l_repo_sync_gui")):
+                if idx > 0:
+                    time.sleep(0.5)
+                url = f"https://github.com/{owner}/{pkg}.git"
+                ok_git, ms_git, detail, attempts = self._probe_git_ls_remote(url)
+                git_ok = git_ok and ok_git
+                status = "OK" if ok_git else "FAIL"
+                lines.append(
+                    f"[Git] ls-remote {pkg} -> {status} ({ms_git} ms, {attempts} 次)"
+                )
+                if detail:
+                    lines.append(f"  {detail}")
+            all_ok = ok_tcp and git_ok
+            self._net_test_bridge.finished.emit(all_ok, "\n".join(lines))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_network_test_finished(self, all_ok: bool, report: str):
+        self._net_test_running = False
+        self.btn_test_network.setEnabled(True)
+        for line in report.splitlines():
+            self._log(line)
+        if all_ok:
+            self._log("[ok] 网络连接测试全部通过")
+            QMessageBox.information(self, "网络连接测试", report)
+        else:
+            self._log("[ERR] 网络连接测试存在失败项")
+            QMessageBox.warning(
+                self,
+                "网络连接测试",
+                report
+                + "\n\n部分检测失败。若仅个别仓库偶发 SSL_ERROR_SYSCALL，"
+                "多为间歇性连接问题，请重试测试或上传。",
+            )
+
     def _start_gh_auth_login(self):
         gh_exe = self._resolve_gh_executable()
         if not gh_exe:
@@ -509,7 +693,12 @@ class RepoSyncWindow(QMainWindow):
     @staticmethod
     def _git_config_prefix(repo_dir: Path | None = None) -> list[str]:
         """git 单次调用参数：不写入全局 gitconfig。"""
-        args = ["-c", f"http.connectTimeout={GIT_HTTP_CONNECT_TIMEOUT_SEC}"]
+        args = [
+            "-c",
+            f"http.connectTimeout={GIT_HTTP_CONNECT_TIMEOUT_SEC}",
+            "-c",
+            "http.version=HTTP/1.1",
+        ]
         if repo_dir is not None:
             safe_path = str(repo_dir.resolve()).replace("\\", "/")
             args.extend(["-c", f"safe.directory={safe_path}"])
