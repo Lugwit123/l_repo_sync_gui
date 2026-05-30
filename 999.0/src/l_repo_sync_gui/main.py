@@ -4,6 +4,7 @@ import ctypes
 import datetime
 import difflib
 import json
+import logging
 import os
 import shutil
 import socket
@@ -12,23 +13,34 @@ import sys
 import threading
 import time
 import urllib.error
+import webbrowser
 import urllib.request
+
+try:
+    import winreg  # 用于读取 Windows IE 代理
+except ImportError:
+    winreg = None
 from pathlib import Path
 
-from PySide6.QtCore import QObject, Qt, Signal
+from PySide6.QtCore import QFile, QObject, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QIcon, QSyntaxHighlighter, QTextCharFormat
+from PySide6.QtUiTools import QUiLoader
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
     QDialog,
+    QDialogButtonBox,
+    QFormLayout,
     QFrame,
+    QGroupBox,
     QHBoxLayout,
     QInputDialog,
     QLabel,
     QLineEdit,
     QMainWindow,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QScrollArea,
     QSplitter,
@@ -37,6 +49,8 @@ from PySide6.QtWidgets import (
     QWidget,
     QTextEdit,
 )
+from l_qt_wgt_lib.smart_widget import CodeEditorWidget, LogCodeHighlighter
+from pytracemp import lprint, LPrint
 
 
 IGNORE_LINES = [
@@ -70,8 +84,11 @@ GITHUB_FILE_LIMIT_BYTES = 100 * 1024 * 1024
 SKIP_DIRS = {"repo_tools"}
 PROTECTED_LOCAL_DELETE = {"l_repo_sync_gui"}
 PREVIEW_MAX_LINES = 300
+AI_MERGE_MAX_FILE_CHARS = 80000
 # Git HTTPS：建立 TCP+TLS 连接阶段最长等待（秒），避免 SSL 握手长时间挂死
 GIT_HTTP_CONNECT_TIMEOUT_SEC = 5
+GIT_FETCH_TIMEOUT_SEC = 25
+REMOTE_FETCH_MAX_WORKERS = 8
 SILICONFLOW_URL = "https://api.siliconflow.cn/v1/chat/completions"
 # 国内硅基流动：直连，不走系统/环境代理（避免误走公司代理导致失败或变慢）
 _SILICONFLOW_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -81,16 +98,89 @@ def _siliconflow_urlopen(req: urllib.request.Request, timeout: float):
     return _SILICONFLOW_OPENER.open(req, timeout=timeout)
 
 
+# ---- AI 模型配置（多提供商）----
+AI_CONFIG_FILE = Path.home() / ".l_repo_sync_gui_ai.json"
 DEFAULT_SILICONFLOW_MODEL = "Qwen/Qwen2.5-72B-Instruct"
-MODEL_PRESETS = [
-    "Qwen/Qwen2.5-72B-Instruct",
-    "deepseek-ai/DeepSeek-V4-Flash",
-    "Pro/zai-org/GLM-4.7",
-]
 DEFAULT_SILICONFLOW_KEY = "sk-gzwtmzfhglvibdbvrttmsuuqsyyjxghxlxzdhubdefmshqoi"
+DEFAULT_ZHIPU_KEY = "263c58d09135c4f088b0d436e3b89bfb.hXFGig2ucu4xe5PT"
+# 内置提供商预设：provider -> (base_url, 默认模型, 默认模型列表)
+AI_PROVIDER_PRESETS = {
+    "siliconflow": {
+        "base_url": "https://api.siliconflow.cn/v1",
+        "model": "Qwen/Qwen2.5-72B-Instruct",
+        "models": [
+            "Qwen/Qwen2.5-72B-Instruct",
+            "deepseek-ai/DeepSeek-V4-Flash",
+            "Pro/zai-org/GLM-4.7",
+        ],
+        "default_key": DEFAULT_SILICONFLOW_KEY,
+    },
+    "zhipu": {
+        "base_url": "https://open.bigmodel.cn/api/paas/v4",
+        "model": "glm-4-flash",
+        "models": [
+            "glm-4-flash",
+            "glm-4-air",
+            "glm-4-plus",
+            "glm-4-long",
+            "glm-4v-flash",
+        ],
+        "default_key": DEFAULT_ZHIPU_KEY,
+    },
+    "deepseek": {
+        "base_url": "https://api.deepseek.com",
+        "model": "deepseek-chat",
+        "models": ["deepseek-chat", "deepseek-reasoner"],
+        "default_key": "",
+    },
+    "custom": {
+        "base_url": "",
+        "model": "",
+        "models": [],
+        "default_key": "",
+    },
+}
+MODEL_PRESETS = AI_PROVIDER_PRESETS["siliconflow"]["models"]  # 兼容老代码
+
+
+def _load_ai_config() -> dict:
+    """读取 AI 配置文件，返回配置字典。不存在则返回默认配置。"""
+    default = {
+        "enabled": True,
+        "provider": "zhipu",
+        "base_url": AI_PROVIDER_PRESETS["zhipu"]["base_url"],
+        "model": AI_PROVIDER_PRESETS["zhipu"]["model"],
+        "api_key": AI_PROVIDER_PRESETS["zhipu"]["default_key"],
+        "model_presets": AI_PROVIDER_PRESETS["zhipu"]["models"],
+    }
+    if not AI_CONFIG_FILE.exists():
+        return default
+    try:
+        data = json.loads(AI_CONFIG_FILE.read_text(encoding="utf-8"))
+        # 填充缺失字段
+        provider = data.get("provider", "zhipu")
+        preset = AI_PROVIDER_PRESETS.get(provider, {})
+        data.setdefault("enabled", True)
+        data.setdefault("provider", provider)
+        data.setdefault("base_url", preset.get("base_url", ""))
+        data.setdefault("model", preset.get("model", ""))
+        data.setdefault("api_key", preset.get("default_key", ""))
+        data.setdefault("model_presets", preset.get("models", []))
+        return data
+    except Exception:
+        return default
+
+
+def _save_ai_config(data: dict):
+    """保存 AI 配置到文件。"""
+    AI_CONFIG_FILE.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
 AUTH_CONFIG_FILE = Path.home() / ".l_repo_sync_gui_auth.json"
+NET_CONFIG_FILE = Path.home() / ".l_repo_sync_gui_net.json"
 APP_ID = "lugwit.l_repo_sync_gui"
 APP_ICON_FILE = Path(__file__).resolve().with_name("app_icon.svg")
+RESOURCES_DIR = Path(__file__).resolve().parent / "resources"
 
 
 def _find_rez_source_root() -> Path:
@@ -118,6 +208,14 @@ class _AiBridge(QObject):
 
 class _NetTestBridge(QObject):
     finished = Signal(bool, str)
+
+
+class _PackageRefreshBridge(QObject):
+    list_ready = Signal(int, list, object, list)
+    status_ready = Signal(int, object)
+    failed = Signal(int, str)
+    one_ready = Signal(str, bool, object, object, str)
+    log = Signal(str)
 
 
 class _AiStreamBridge(QObject):
@@ -164,208 +262,169 @@ class RepoSyncWindow(QMainWindow):
         if APP_ICON_FILE.exists():
             self.setWindowIcon(QIcon(str(APP_ICON_FILE)))
 
-        self.owner_edit = QLineEdit("Lugwit123")
-        self.owner_edit.setPlaceholderText("GitHub owner, e.g. Lugwit123")
-        self.git_path_edit = QLineEdit()
-        self.git_path_edit.setPlaceholderText("git.exe path (optional, auto-detect if empty)")
-        self.gh_path_edit = QLineEdit()
-        self.gh_path_edit.setPlaceholderText("gh.exe path (optional, auto-detect if empty)")
-        self.gh_token_edit = QLineEdit()
-        self.gh_token_edit.setPlaceholderText("GitHub token (used by GH_TOKEN)")
-        self.gh_token_edit.setEchoMode(QLineEdit.Password)
-        self.api_key_edit = QLineEdit(
-            os.environ.get("SILICONFLOW_API_KEY", DEFAULT_SILICONFLOW_KEY)
-        )
-        self.api_key_edit.setEchoMode(QLineEdit.Password)
-        self.api_key_edit.setPlaceholderText("SiliconFlow API Key")
-        self.model_edit = QComboBox()
-        self.model_edit.setEditable(True)
-        self.model_edit.addItems(MODEL_PRESETS)
-        self.model_edit.setCurrentText(DEFAULT_SILICONFLOW_MODEL)
-        if self.model_edit.lineEdit():
-            self.model_edit.lineEdit().setPlaceholderText("SiliconFlow model")
-        self.ai_prompt_edit = QTextEdit()
-        self.ai_prompt_edit.setPlaceholderText("输入问题，例如：请总结当前上传预览的风险点")
-        self.ai_prompt_edit.setMinimumHeight(120)
-        self.ai_answer_edit = QTextEdit()
-        self.ai_answer_edit.setReadOnly(True)
-        self.ai_answer_edit.setMinimumHeight(220)
-        self.ai_ask_btn: QPushButton | None = None
-        self.ai_bridge = _AiBridge()
-        self.ai_bridge.finished.connect(self._on_ai_result)
-
-        self.log_edit = QTextEdit()
-        self.log_edit.setReadOnly(True)
-        self.log_edit.setMinimumHeight(180)
         self.row_buttons = []
         self.package_entries: list[tuple[str, Path, bool]] = []
         self.package_status_labels: dict[str, QLabel] = {}
+        self.package_sync_map: dict[str, dict[str, int]] = {}
+        self.package_merge_buttons: dict[str, QPushButton] = {}
+        self.package_refresh_buttons: dict[str, QPushButton] = {}
         self.btn_refresh_status: QPushButton | None = None
+        self.btn_refresh_packages: QPushButton | None = None
+        self.ai_ask_btn: QPushButton | None = None
+        self._package_refresh_token = 0
+        self._package_refresh_running = False
+        self._package_refresh_bridge = _PackageRefreshBridge()
+        self._package_refresh_bridge.list_ready.connect(self._on_package_list_ready)
+        self._package_refresh_bridge.status_ready.connect(self._on_package_status_ready)
+        self._package_refresh_bridge.failed.connect(self._on_package_refresh_failed)
+        self._package_refresh_bridge.one_ready.connect(self._on_one_package_status_ready)
+        self._package_refresh_bridge.log.connect(self._log)
+        self.ai_bridge = _AiBridge()
+        self.ai_bridge.finished.connect(self._on_ai_result)
 
-        self._apply_style()
-        self._build_ui()
-        self.refresh_packages()
+        self._load_style()
+        self._load_ui()
+        self._log_file_handler = None
+        self._init_log_file()
+        QTimer.singleShot(0, self._start_package_list_refresh)
 
-    def _apply_style(self):
-        self.setStyleSheet(
-            """
-            QMainWindow { background: #1f1f22; }
-            QLabel { font-size: 13px; }
-            QPushButton { min-height: 28px; padding: 1px 8px; }
-            QLineEdit, QTextEdit {
-                font-size: 13px;
-                border: 1px solid #3b3b3f;
-                border-radius: 4px;
-                padding: 6px;
-            }
-            """
+    def _load_style(self):
+        qss_path = RESOURCES_DIR / "style.qss"
+        if qss_path.exists():
+            self.setStyleSheet(qss_path.read_text(encoding="utf-8"))
+
+    def closeEvent(self, event):
+        """窗口关闭时清理资源。"""
+        if hasattr(self, "_log_file_handler") and self._log_file_handler:
+            try:
+                self._log_file_handler.close()
+            except Exception:
+                pass
+        super().closeEvent(event)
+    
+    def _load_ui(self):
+        ui_path = RESOURCES_DIR / "main_window.ui"
+        loader = QUiLoader()
+        ui_file = QFile(str(ui_path))
+        ui_file.open(QFile.ReadOnly)
+        central = loader.load(ui_file, self)
+        ui_file.close()
+        self.setCentralWidget(central)
+    
+        # 绑定 .ui 中通过 objectName 定义的控件
+        self.owner_edit = central.findChild(QLineEdit, "owner_edit")
+        self.git_path_edit = central.findChild(QLineEdit, "git_path_edit")
+        self.gh_path_edit = central.findChild(QLineEdit, "gh_path_edit")
+        self.gh_token_edit = central.findChild(QLineEdit, "gh_token_edit")
+        self.btn_model_settings = central.findChild(QPushButton, "btn_model_settings")
+        self.model_edit = central.findChild(QComboBox, "model_edit")
+        self.ai_prompt_edit = central.findChild(QTextEdit, "ai_prompt_edit")
+        self.ai_answer_edit = central.findChild(QTextEdit, "ai_answer_edit")
+        log_placeholder = central.findChild(QTextEdit, "log_edit")
+        self.list_area = central.findChild(QScrollArea, "list_area")
+
+        # ---- 日志组件替换为 CodeEditorWidget（带行号 + 日志语法高亮）----
+        parent_container = log_placeholder.parentWidget()
+        geo = log_placeholder.geometry()
+        size_pol = log_placeholder.sizePolicy()
+        min_h = log_placeholder.minimumHeight()
+        max_h = log_placeholder.maximumHeight()
+        stretch = 0
+
+        parent_layout = parent_container.layout() if parent_container else None
+        if parent_layout is not None:
+            idx = parent_layout.indexOf(log_placeholder)
+            if idx >= 0:
+                # getItemPosition 仅 QGridLayout 支持；QBoxLayout 用 stretch()
+                if hasattr(parent_layout, "getItemPosition"):
+                    _, _, _, stretch = parent_layout.getItemPosition(idx)
+                else:
+                    stretch = parent_layout.stretch(idx)
+                parent_layout.removeItem(parent_layout.itemAt(idx))
+        log_placeholder.setParent(None)
+        log_placeholder.deleteLater()
+
+        self.log_edit = CodeEditorWidget(parent_container)
+        self.log_edit.setObjectName("log_edit")
+        self.log_edit.setReadOnly(True)
+        self.log_edit.set_highlighter(LogCodeHighlighter)
+        self.log_edit.setPlaceholderText("日志输出（右键可切换高亮模式，Ctrl+滚轮缩放字体）")
+        self.log_edit.setGeometry(geo)
+        self.log_edit.setSizePolicy(size_pol)
+        if min_h > 0:
+            self.log_edit.setMinimumHeight(min_h)
+        if max_h < 16777215:
+            self.log_edit.setMaximumHeight(max_h)
+
+        if parent_layout is not None and idx >= 0:
+            parent_layout.insertWidget(idx, self.log_edit, stretch=stretch)
+        self.list_widget = central.findChild(QWidget, "list_widget")
+        self.list_layout = self.list_widget.layout() if self.list_widget else None
+        self.btn_refresh_packages = central.findChild(QPushButton, "btn_refresh_packages")
+        self.btn_refresh_status = central.findChild(QPushButton, "btn_refresh_status")
+        self.ai_ask_btn = central.findChild(QPushButton, "ai_ask_btn")
+        btn_upload_all = central.findChild(QPushButton, "btn_upload_all")
+        btn_download_all = central.findChild(QPushButton, "btn_download_all")
+        btn_restart = central.findChild(QPushButton, "btn_restart")
+        btn_save_token = central.findChild(QPushButton, "btn_save_token")
+        btn_clear_token = central.findChild(QPushButton, "btn_clear_token")
+        btn_auth_status = central.findChild(QPushButton, "btn_auth_status")
+        self.btn_test_network = central.findChild(QPushButton, "btn_test_network")
+        btn_network_settings = central.findChild(QPushButton, "btn_network_settings")
+        btn_gh_login = central.findChild(QPushButton, "btn_gh_login")
+        btn_model_test = central.findChild(QPushButton, "btn_model_test")
+        body_splitter = central.findChild(QSplitter, "body_splitter")
+        left_panel = central.findChild(QSplitter, "left_panel")
+    
+        # list_layout 对齐方式（.ui 中无法直接设 AlignTop）
+        if self.list_layout:
+            self.list_layout.setAlignment(Qt.AlignTop)
+    
+        # 初始化动态属性
+        # 加载 AI 配置（provider / api_key / model / presets）
+        self._ai_config = _load_ai_config()
+        self._refresh_model_edit_from_config()
+        if self.btn_model_settings:
+            self.btn_model_settings.clicked.connect(self._open_model_settings_dialog)
+        self._log(
+            f"[info] AI 配置: provider={self._ai_config.get('provider')} "
+            f"model={self._ai_config.get('model')} "
+            f"enabled={self._ai_config.get('enabled')}"
         )
-        self._row_button_style = "QPushButton { min-height: 20px; max-height: 20px; padding: 0px 4px; font-size: 11px; }"
-
-    def _build_ui(self):
-        root = QWidget(self)
-        main_layout = QVBoxLayout(root)
-        main_layout.setContentsMargins(12, 10, 12, 12)
-        main_layout.setSpacing(10)
-
-        top_bar = QFrame()
-        top_bar.setFrameShape(QFrame.StyledPanel)
-        top_lay = QVBoxLayout(top_bar)
-        top_lay.setContentsMargins(10, 8, 10, 8)
-        top_lay.setSpacing(8)
-
-        owner_line = QHBoxLayout()
-        owner_line.setSpacing(8)
-        owner_line.addWidget(QLabel("GitHub Owner:"))
-        self.owner_edit.setMinimumWidth(240)
-        owner_line.addWidget(self.owner_edit, 1)
-
-        btn_refresh = QPushButton("刷新包列表")
-        btn_refresh.clicked.connect(self.refresh_packages)
-        owner_line.addWidget(btn_refresh)
-
-        self.btn_refresh_status = QPushButton("刷新包状态")
-        self.btn_refresh_status.setToolTip("重新扫描各包的 git 状态（修改/暂存/未跟踪等），不重建列表")
+    
+        # 分割器尺寸（.ui 不可靠，代码保证）
+        if body_splitter:
+            body_splitter.setStretchFactor(0, 3)
+            body_splitter.setStretchFactor(1, 2)
+            body_splitter.setSizes([760, 500])
+        if left_panel:
+            left_panel.setStretchFactor(0, 3)
+            left_panel.setStretchFactor(1, 2)
+            left_panel.setSizes([430, 260])
+    
+        # 信号连接
+        self.btn_refresh_packages.clicked.connect(self.refresh_packages)
         self.btn_refresh_status.clicked.connect(self.refresh_package_status)
-        owner_line.addWidget(self.btn_refresh_status)
-
-        btn_upload_all = QPushButton("批量上传")
         btn_upload_all.clicked.connect(self.upload_all)
-        owner_line.addWidget(btn_upload_all)
-
-        btn_download_all = QPushButton("批量下载")
         btn_download_all.clicked.connect(self.download_all)
-        owner_line.addWidget(btn_download_all)
-
-        btn_restart = QPushButton("重启")
         btn_restart.clicked.connect(self.restart_self)
-        owner_line.addWidget(btn_restart)
-        top_lay.addLayout(owner_line)
-
-        gh_line = QHBoxLayout()
-        gh_line.setSpacing(8)
-        gh_line.addWidget(QLabel("git.exe:"))
-        gh_line.addWidget(self.git_path_edit, 1)
-        gh_line.addWidget(QLabel("gh.exe:"))
-        gh_line.addWidget(self.gh_path_edit, 1)
-        top_lay.addLayout(gh_line)
-
-        auth_line = QHBoxLayout()
-        auth_line.setSpacing(8)
-        auth_line.addWidget(QLabel("GitHub Token:"))
-        auth_line.addWidget(self.gh_token_edit, 1)
-        btn_save_token = QPushButton("保存Token")
         btn_save_token.clicked.connect(self._save_auth_settings)
-        auth_line.addWidget(btn_save_token)
-        btn_clear_token = QPushButton("清除Token")
         btn_clear_token.clicked.connect(self._clear_auth_token)
-        auth_line.addWidget(btn_clear_token)
-        btn_auth_status = QPushButton("检查授权")
         btn_auth_status.clicked.connect(self._check_github_auth)
-        auth_line.addWidget(btn_auth_status)
-        self.btn_test_network = QPushButton("测试网络连接")
-        self.btn_test_network.setToolTip(
-            "检测 github.com:443 与 Git HTTPS（ls-remote），用于排查 push/fetch 失败"
-        )
         self.btn_test_network.clicked.connect(self._test_network_connection)
-        auth_line.addWidget(self.btn_test_network)
+        btn_network_settings.clicked.connect(self._open_network_settings_dialog)
+        btn_gh_login.clicked.connect(self._start_gh_auth_login)
+        btn_model_test.clicked.connect(self._test_model_connection)
+        self.ai_ask_btn.clicked.connect(self.ask_ai)
+    
+        # 网络测试桥接
         self._net_test_bridge = _NetTestBridge()
         self._net_test_bridge.finished.connect(self._on_network_test_finished)
         self._net_test_running = False
-        btn_gh_login = QPushButton("网页登录授权")
-        btn_gh_login.clicked.connect(self._start_gh_auth_login)
-        auth_line.addWidget(btn_gh_login)
-        top_lay.addLayout(auth_line)
-
-        main_layout.addWidget(top_bar)
-
-        body_splitter = QSplitter(Qt.Horizontal)
-        body_splitter.setChildrenCollapsible(False)
-
-        left_panel = QSplitter(Qt.Vertical)
-        left_panel.setChildrenCollapsible(False)
-
-        pkg_panel = QWidget()
-        left_layout = QVBoxLayout(pkg_panel)
-        left_layout.setContentsMargins(0, 0, 0, 0)
-        left_layout.setSpacing(6)
-        left_layout.addWidget(QLabel("包列表:"))
-        self.list_area = QScrollArea()
-        self.list_area.setWidgetResizable(True)
-        self.list_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.list_widget = QWidget()
-        self.list_layout = QVBoxLayout(self.list_widget)
-        self.list_layout.setContentsMargins(0, 0, 0, 0)
-        self.list_layout.setSpacing(1)
-        self.list_layout.setAlignment(Qt.AlignTop)
-        self.list_area.setWidget(self.list_widget)
-        left_layout.addWidget(self.list_area, 1)
-
-        log_panel = QWidget()
-        log_layout = QVBoxLayout(log_panel)
-        log_layout.setContentsMargins(0, 0, 0, 0)
-        log_layout.setSpacing(6)
-        log_layout.addWidget(QLabel("日志输出:"))
-        log_layout.addWidget(self.log_edit, 1)
-
-        left_panel.addWidget(pkg_panel)
-        left_panel.addWidget(log_panel)
-        left_panel.setStretchFactor(0, 3)
-        left_panel.setStretchFactor(1, 2)
-        left_panel.setSizes([430, 260])
-
-        right_panel = QWidget()
-        right_layout = QVBoxLayout(right_panel)
-        right_layout.setContentsMargins(0, 0, 0, 0)
-        right_layout.setSpacing(8)
-        ai_line = QHBoxLayout()
-        ai_line.setSpacing(8)
-        ai_line.addWidget(QLabel("硅基 Key:"))
-        ai_line.addWidget(self.api_key_edit, 2)
-        ai_line.addWidget(QLabel("模型:"))
-        ai_line.addWidget(self.model_edit, 1)
-        btn_model_test = QPushButton("测试模型连接")
-        btn_model_test.clicked.connect(self._test_model_connection)
-        ai_line.addWidget(btn_model_test)
-        self.ai_ask_btn = QPushButton("问AI")
-        self.ai_ask_btn.clicked.connect(self.ask_ai)
-        ai_line.addWidget(self.ai_ask_btn)
-        right_layout.addLayout(ai_line)
-        right_layout.addWidget(QLabel("AI提问:"))
-        right_layout.addWidget(self.ai_prompt_edit)
-        right_layout.addWidget(QLabel("AI回复:"))
-        right_layout.addWidget(self.ai_answer_edit, 1)
-        body_splitter.addWidget(left_panel)
-        body_splitter.addWidget(right_panel)
-        body_splitter.setStretchFactor(0, 3)
-        body_splitter.setStretchFactor(1, 2)
-        body_splitter.setSizes([760, 500])
-
-        main_layout.addWidget(body_splitter, 1)
-
-        self.setCentralWidget(root)
+    
         self._init_gh_path()
         self._load_auth_settings()
+        self._load_network_settings()
 
     def _init_gh_path(self):
         """初始化 git/gh 路径输入框：优先环境变量，其次自动探测。"""
@@ -416,6 +475,753 @@ class RepoSyncWindow(QMainWindow):
         self.gh_token_edit.clear()
         self._save_auth_settings()
         self._log("[info] 已清除 GitHub Token。")
+
+    # ------------------------------------------------------------------
+    # 网络设置（代理 / NO_PROXY / git 代理 / HTTP 版本）
+    # ------------------------------------------------------------------
+    HTTP_VERSION_CHOICES = [
+        ("自动（默认）", ""),
+        ("HTTP/1.1（降低 SSL_ERROR_SYSCALL 概率）", "HTTP/1.1"),
+        ("HTTP/2（更快但某些代理不兼容）", "HTTP/2"),
+    ]
+
+    PROXY_MODE_CHOICES = [
+        ("不使用代理", "none"),
+        ("使用 IE 代理（读取 Windows Internet 设置）", "ie"),
+        ("自定义代理", "custom"),
+    ]
+
+    # ------------------------------------------------------------------
+    # 读取 Windows IE 代理
+    # ------------------------------------------------------------------
+    def _read_ie_proxy(self) -> dict:
+        """读取 Windows IE 代理设置，返回 {'enable': bool, 'server': str, 'override': str}。"""
+        result = {"enable": False, "server": "", "override": ""}
+        if winreg is None:
+            return result
+        try:
+            key_path = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings"
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path) as key:
+                try:
+                    enable, _ = winreg.QueryValueEx(key, "ProxyEnable")
+                    result["enable"] = bool(enable)
+                except FileNotFoundError:
+                    pass
+                try:
+                    server, _ = winreg.QueryValueEx(key, "ProxyServer")
+                    result["server"] = str(server or "")
+                except FileNotFoundError:
+                    pass
+                try:
+                    override, _ = winreg.QueryValueEx(key, "ProxyOverride")
+                    result["override"] = str(override or "")
+                except FileNotFoundError:
+                    pass
+        except Exception:
+            pass
+        return result
+
+    def _parse_ie_proxy_server(self, server: str) -> dict:
+        """将 IE ProxyServer 字符串解析为 {http, https, socks}。
+        支持格式：
+        - 单一地址：'host:port'
+        - 分协议：'http=host:port;https=host:port;socks=host:port'
+        - FTP 前缀忽略：'ftp=...;http=...;https=...'
+        """
+        parsed = {"http": "", "https": "", "socks": ""}
+        if not server:
+            return parsed
+        # 如果不含 '='，视为单一地址同时应用于 http/https
+        if "=" not in server:
+            parsed["http"] = f"http://{server}"
+            parsed["https"] = f"http://{server}"
+            return parsed
+        for part in server.split(";"):
+            if "=" not in part:
+                continue
+            k, v = part.split("=", 1)
+            k = k.strip().lower()
+            v = v.strip()
+            if not v:
+                continue
+            # 自动加 http:// 前缀（如果没写协议）
+            if "://" not in v:
+                v = f"http://{v}"
+            if k == "http":
+                parsed["http"] = v
+            elif k == "https":
+                parsed["https"] = v
+            elif k in ("socks", "socks5", "socks4"):
+                # IE 的 socks 字段一般不带 socks:// 前缀
+                parsed["socks"] = v
+        return parsed
+
+    def _ie_override_to_no_proxy(self, override: str) -> str:
+        """将 IE ProxyOverride（如 '<local>;*.company.com'）转为 NO_PROXY 格式。"""
+        if not override:
+            return ""
+        items = [x.strip() for x in override.split(";") if x.strip()]
+        # 过滤掉 <local>（表示本地地址）并替换为常见本地域名
+        out = []
+        for it in items:
+            if it.lower() == "<local>":
+                out.extend(["localhost", "127.0.0.1"])
+            else:
+                out.append(it)
+        # 去重保持顺序
+        seen = set()
+        result = []
+        for x in out:
+            if x not in seen:
+                seen.add(x)
+                result.append(x)
+        return ",".join(result)
+
+    def _apply_git_http_version(self, version: str, git_exe: str | None):
+        """应用 git http.version 配置。version 为空字符串时清除配置。"""
+        if not git_exe:
+            return
+        try:
+            if version:
+                subprocess.run(
+                    [git_exe, "config", "--global", "http.version", version],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                    timeout=10,
+                )
+            else:
+                # 未选中时尝试恢复默认（取消设置）
+                subprocess.run(
+                    [git_exe, "config", "--global", "--unset", "http.version"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                    timeout=10,
+                )
+        except Exception:
+            pass
+
+    def _load_network_settings(self):
+        """从本地配置文件读取网络设置，并应用到环境变量（仅本进程）。"""
+        try:
+            if not NET_CONFIG_FILE.exists():
+                return
+            data = json.loads(NET_CONFIG_FILE.read_text(encoding="utf-8"))
+            if not data.get("enabled", False):
+                self._log("[info] 网络配置存在但未启用。")
+                return
+
+            proxy_mode = (data.get("proxy_mode") or "none").strip()
+            http_version = (data.get("http_version") or "").strip()
+            apply_git = bool(data.get("apply_git_proxy", False))
+            git_proxy = (data.get("git_proxy") or "").strip()
+
+            # 根据 proxy_mode 决定实际使用的代理地址
+            http_proxy = https_proxy = all_proxy = no_proxy = ""
+            mode_label = "不使用代理"
+
+            if proxy_mode == "ie":
+                ie = self._read_ie_proxy()
+                if ie["enable"] and ie["server"]:
+                    parsed = self._parse_ie_proxy_server(ie["server"])
+                    http_proxy = parsed["http"]
+                    https_proxy = parsed["https"]
+                    all_proxy = parsed["socks"]
+                    no_proxy = self._ie_override_to_no_proxy(ie["override"])
+                    mode_label = f"IE 代理 ({ie['server']})"
+                else:
+                    mode_label = "IE 代理（未启用）"
+            elif proxy_mode == "custom":
+                http_proxy = (data.get("http_proxy") or "").strip()
+                https_proxy = (data.get("https_proxy") or "").strip()
+                all_proxy = (data.get("all_proxy") or "").strip()
+                no_proxy = (data.get("no_proxy") or "").strip()
+                mode_label = "自定义代理"
+            else:
+                mode_label = "不使用代理"
+
+            # 清除已有的代理环境变量（避免残留）
+            for key in ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy",
+                        "ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy"):
+                os.environ.pop(key, None)
+
+            # 应用新的代理环境变量（仅当不是 "none" 模式）
+            if proxy_mode != "none":
+                # 自动追加 github.com / api.github.com 到 NO_PROXY
+                # 原因：某些代理（如 Clash）对 api.github.com 的 TLS 支持异常，
+                #       而 github.com 通常直连即可，避免 gh CLI 误走代理导致超时。
+                extra_no_proxy = ["github.com", "api.github.com"]
+                if no_proxy:
+                    existing = [x.strip() for x in no_proxy.split(",") if x.strip()]
+                    for d in extra_no_proxy:
+                        if d not in existing and not any(
+                            p.startswith(".") and d.endswith(p[1:]) for p in existing if p.startswith(".")
+                        ):
+                            existing.append(d)
+                    no_proxy = ",".join(existing)
+                else:
+                    no_proxy = ",".join(extra_no_proxy)
+
+                if http_proxy:
+                    os.environ["HTTP_PROXY"] = http_proxy
+                    os.environ["http_proxy"] = http_proxy
+                if https_proxy:
+                    os.environ["HTTPS_PROXY"] = https_proxy
+                    os.environ["https_proxy"] = https_proxy
+                if all_proxy:
+                    os.environ["ALL_PROXY"] = all_proxy
+                    os.environ["all_proxy"] = all_proxy
+                if no_proxy:
+                    os.environ["NO_PROXY"] = no_proxy
+                    os.environ["no_proxy"] = no_proxy
+
+            git_exe = self._resolve_git_executable()
+
+            # 根据模式决定 git 全局代理
+            # - none：清除 git 全局代理
+            # - ie：将解析到的代理写入 git 全局
+            # - custom：仅当用户勾选 "启用 git 代理" 时才写入
+            if git_exe:
+                effective_git_proxy = ""
+                if proxy_mode == "ie" and (http_proxy or https_proxy):
+                    effective_git_proxy = https_proxy or http_proxy
+                elif proxy_mode == "custom" and apply_git and git_proxy:
+                    effective_git_proxy = git_proxy
+
+                if effective_git_proxy:
+                    subprocess.run(
+                        [git_exe, "config", "--global", "http.proxy", effective_git_proxy],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                        check=False, timeout=10,
+                    )
+                    subprocess.run(
+                        [git_exe, "config", "--global", "https.proxy", effective_git_proxy],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                        check=False, timeout=10,
+                    )
+                else:
+                    # 清除全局 git 代理
+                    subprocess.run(
+                        [git_exe, "config", "--global", "--unset", "http.proxy"],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                        check=False, timeout=10,
+                    )
+                    subprocess.run(
+                        [git_exe, "config", "--global", "--unset", "https.proxy"],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                        check=False, timeout=10,
+                    )
+
+            # 写入全局 git http.version
+            self._apply_git_http_version(http_version, git_exe)
+
+            self._log(
+                f"[ok] 已应用网络配置: "
+                f"模式={mode_label} "
+                f"HTTP={http_proxy or '-'} "
+                f"HTTPS={https_proxy or '-'} "
+                f"NO_PROXY={no_proxy or '-'} "
+                f"http.version={http_version or 'default'}"
+            )
+        except Exception as exc:
+            self._log(f"[WARN] 加载网络配置失败: {exc}")
+
+    def _save_network_settings_to_file(self, payload: dict):
+        """保存网络配置到 JSON 文件。"""
+        NET_CONFIG_FILE.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    def _read_network_settings_from_file(self) -> dict:
+        try:
+            if not NET_CONFIG_FILE.exists():
+                return {}
+            return json.loads(NET_CONFIG_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+
+    def _open_network_settings_dialog(self):
+        """弹出网络设置对话框。"""
+        dlg = QDialog(self)
+        dlg.setWindowTitle("网络设置")
+        dlg.resize(600, 540)
+
+        root_layout = QVBoxLayout(dlg)
+
+        # ---- 全局启用 ----
+        chk_enabled = QCheckBox("启用网络设置（关闭后不应用任何代理）")
+
+        # ---- 代理模式分组 ----
+        grp_mode = QGroupBox("代理模式")
+        mode_layout = QVBoxLayout(grp_mode)
+        cb_mode = QComboBox()
+        for label, _ in self.PROXY_MODE_CHOICES:
+            cb_mode.addItem(label)
+        mode_layout.addWidget(cb_mode)
+
+        # IE 代理状态信息
+        ie_info_label = QLabel()
+        ie_info_label.setWordWrap(True)
+        ie_info_label.setStyleSheet("color: #555; font-size: 11px;")
+        ie_info_label.setVisible(False)
+        mode_layout.addWidget(ie_info_label)
+
+        # ---- 自定义代理分组 ----
+        grp_proxy = QGroupBox("自定义代理（仅当模式为「自定义代理」时生效）")
+        form_proxy = QFormLayout(grp_proxy)
+        ed_http = QLineEdit()
+        ed_http.setPlaceholderText("http://user:pass@host:port  或 socks5://host:port")
+        ed_https = QLineEdit()
+        ed_https.setPlaceholderText("http://user:pass@host:port  或 socks5://host:port")
+        ed_all = QLineEdit()
+        ed_all.setPlaceholderText("socks5://host:port  （同时覆盖 HTTP/HTTPS）")
+        ed_no = QLineEdit()
+        ed_no.setPlaceholderText("localhost,127.0.0.1,.company.com")
+        form_proxy.addRow("HTTP_PROXY:", ed_http)
+        form_proxy.addRow("HTTPS_PROXY:", ed_https)
+        form_proxy.addRow("ALL_PROXY:", ed_all)
+        form_proxy.addRow("NO_PROXY:", ed_no)
+
+        # ---- git 代理分组 ----
+        grp_git = QGroupBox("Git 设置（写入 git config --global，重启后仍生效）")
+        form_git = QFormLayout(grp_git)
+        chk_git = QCheckBox("启用 git 代理（仅「自定义」模式需勾选；「IE」模式自动写入）")
+        ed_git = QLineEdit()
+        ed_git.setPlaceholderText("http://host:port  或 socks5://host:port")
+        cb_http_version = QComboBox()
+        for label, _ in self.HTTP_VERSION_CHOICES:
+            cb_http_version.addItem(label)
+        form_git.addRow(chk_git)
+        form_git.addRow("git http/https.proxy:", ed_git)
+        form_git.addRow("git http.version:", cb_http_version)
+
+        # ---- 按钮 ----
+        btn_box = QDialogButtonBox(
+            QDialogButtonBox.Ok | QDialogButtonBox.Cancel | QDialogButtonBox.Reset
+        )
+        btn_box.accepted.connect(dlg.accept)
+        btn_box.rejected.connect(dlg.reject)
+        btn_reset = btn_box.button(QDialogButtonBox.Reset)
+
+        # ---- 模式切换回调 ----
+        def _on_mode_changed(idx: int):
+            mode = self.PROXY_MODE_CHOICES[idx][1]
+            custom_enabled = (mode == "custom")
+            ed_http.setEnabled(custom_enabled)
+            ed_https.setEnabled(custom_enabled)
+            ed_all.setEnabled(custom_enabled)
+            ed_no.setEnabled(custom_enabled)
+            ed_git.setEnabled(custom_enabled)
+            chk_git.setEnabled(custom_enabled)
+
+            if mode == "ie":
+                ie = self._read_ie_proxy()
+                if ie["enable"] and ie["server"]:
+                    parsed = self._parse_ie_proxy_server(ie["server"])
+                    info_lines = [
+                        f"检测到 IE 代理: {ie['server']}",
+                        f"HTTP={parsed['http'] or '-'}  HTTPS={parsed['https'] or '-'}  SOCKS={parsed['socks'] or '-'}",
+                    ]
+                    if ie["override"]:
+                        info_lines.append(f"ProxyOverride: {ie['override']}")
+                    ie_info_label.setText("\n".join(info_lines))
+                else:
+                    ie_info_label.setText("IE 代理未启用或无 ProxyServer 配置。")
+                ie_info_label.setVisible(True)
+            else:
+                ie_info_label.setVisible(False)
+
+        cb_mode.currentIndexChanged.connect(_on_mode_changed)
+
+        # ---- 加载现有配置 ----
+        cur = self._read_network_settings_from_file()
+        # 加载模式
+        cur_mode = (cur.get("proxy_mode") or "none").strip()
+        cb_mode.setCurrentIndex(0)
+        for i, (_, v) in enumerate(self.PROXY_MODE_CHOICES):
+            if v == cur_mode:
+                cb_mode.setCurrentIndex(i)
+                break
+        ed_http.setText(cur.get("http_proxy", ""))
+        ed_https.setText(cur.get("https_proxy", ""))
+        ed_all.setText(cur.get("all_proxy", ""))
+        ed_no.setText(cur.get("no_proxy", ""))
+        chk_git.setChecked(bool(cur.get("apply_git_proxy", False)))
+        ed_git.setText(cur.get("git_proxy", ""))
+        cur_ver = (cur.get("http_version") or "").strip()
+        cb_http_version.setCurrentIndex(0)
+        for i, (_, v) in enumerate(self.HTTP_VERSION_CHOICES):
+            if v == cur_ver:
+                cb_http_version.setCurrentIndex(i)
+                break
+        chk_enabled.setChecked(bool(cur.get("enabled", False)))
+        _on_mode_changed(cb_mode.currentIndex())
+
+        def _on_reset():
+            cb_mode.setCurrentIndex(0)  # "不使用代理"
+            ed_http.clear()
+            ed_https.clear()
+            ed_all.clear()
+            ed_no.clear()
+            ed_git.clear()
+            chk_git.setChecked(False)
+            cb_http_version.setCurrentIndex(0)
+            chk_enabled.setChecked(False)
+            _on_mode_changed(0)
+
+        btn_reset.clicked.connect(_on_reset)
+
+        root_layout.addWidget(chk_enabled)
+        root_layout.addWidget(grp_mode)
+        root_layout.addWidget(grp_proxy)
+        root_layout.addWidget(grp_git)
+        root_layout.addWidget(btn_box)
+
+        result = dlg.exec()
+        if result != QDialog.Accepted:
+            self._log("[info] 网络设置已取消。")
+            return
+
+        payload = {
+            "enabled": chk_enabled.isChecked(),
+            "proxy_mode": self.PROXY_MODE_CHOICES[cb_mode.currentIndex()][1],
+            "http_proxy": ed_http.text().strip(),
+            "https_proxy": ed_https.text().strip(),
+            "all_proxy": ed_all.text().strip(),
+            "no_proxy": ed_no.text().strip(),
+            "apply_git_proxy": chk_git.isChecked(),
+            "git_proxy": ed_git.text().strip(),
+            "http_version": self.HTTP_VERSION_CHOICES[cb_http_version.currentIndex()][1],
+        }
+        try:
+            self._save_network_settings_to_file(payload)
+            self._log(f"[ok] 网络配置已保存: {NET_CONFIG_FILE}")
+            # 重新加载并应用到当前进程
+            self._load_network_settings()
+            QMessageBox.information(
+                self,
+                "保存成功",
+                f"网络配置已保存到:\n{NET_CONFIG_FILE}\n\n"
+                "（代理环境变量已在当前进程生效；git 代理已写入全局配置）",
+            )
+        except Exception as exc:
+            self._log(f"[ERR] 保存网络配置失败: {exc}")
+            QMessageBox.warning(self, "保存失败", str(exc))
+
+    def _open_model_settings_dialog(self):
+        """弹出 AI 模型设置对话框。"""
+        dlg = QDialog(self)
+        dlg.setWindowTitle("AI 模型设置")
+        dlg.resize(620, 560)
+        root = QVBoxLayout(dlg)
+
+        cfg = dict(self._ai_config or {})
+
+        # ---- 全局启用 ----
+        chk_enabled = QCheckBox("启用 AI 模型功能（取消勾选后所有 AI 调用将被跳过）")
+        chk_enabled.setChecked(bool(cfg.get("enabled", True)))
+        root.addWidget(chk_enabled)
+
+        # ---- 提供商 ----
+        provider_row = QHBoxLayout()
+        provider_row.addWidget(QLabel("提供商:"))
+        cmb_provider = QComboBox()
+        provider_labels = [
+            ("zhipu", "智谱 AI (Zhipu BigModel)"),
+            ("siliconflow", "硅基流动 (SiliconFlow)"),
+            ("deepseek", "DeepSeek"),
+            ("custom", "自定义 (OpenAI 兼容)"),
+        ]
+        for key, label in provider_labels:
+            cmb_provider.addItem(label, key)
+        current_provider = cfg.get("provider", "zhipu")
+        for i in range(cmb_provider.count()):
+            if cmb_provider.itemData(i) == current_provider:
+                cmb_provider.setCurrentIndex(i)
+                break
+        provider_row.addWidget(cmb_provider, 1)
+        root.addLayout(provider_row)
+
+        # ---- Base URL ----
+        root.addWidget(QLabel("Base URL (OpenAI 兼容 API 根地址):"))
+        edit_base = QLineEdit()
+        edit_base.setPlaceholderText("例如: https://open.bigmodel.cn/api/paas/v4")
+        edit_base.setText(cfg.get("base_url", ""))
+        root.addWidget(edit_base)
+
+        # ---- API Key ----
+        root.addWidget(QLabel("API Key:"))
+        edit_key = QLineEdit()
+        edit_key.setEchoMode(QLineEdit.Password)
+        edit_key.setPlaceholderText("粘贴你的 API Key")
+        edit_key.setText(cfg.get("api_key", ""))
+        root.addWidget(edit_key)
+
+        # ---- 当前模型 ----
+        model_row = QHBoxLayout()
+        model_row.addWidget(QLabel("当前模型:"))
+        cmb_model = QComboBox()
+        # 保持可编辑：既能下拉选，也能手动输入任意模型名
+        cmb_model.setEditable(True)
+        cmb_model.setInsertPolicy(QComboBox.NoInsert)
+        # 强调下拉箭头视觉效果
+        cmb_model.setStyleSheet(
+            "QComboBox { padding: 2px 6px; }"
+            "QComboBox::drop-down { subcontrol-origin: padding; subcontrol-position: top right; "
+            "                    width: 24px; border-left: 1px solid #555; }"
+            "QComboBox::down-arrow { image: none; border-left: 5px solid transparent; "
+            "                       border-right: 5px solid transparent; border-top: 7px solid palette(text); "
+            "                       margin-right: 6px; }"
+        )
+        presets = list(cfg.get("model_presets") or [])
+        cur_model = (cfg.get("model") or "").strip()
+        if cur_model and cur_model not in presets:
+            presets.insert(0, cur_model)
+        if presets:
+            cmb_model.addItems(presets)
+        if cur_model:
+            cmb_model.setCurrentText(cur_model)
+        cmb_model.setToolTip("下拉选择预设模型，也可直接输入任意模型名")
+        model_row.addWidget(cmb_model, 1)
+        root.addLayout(model_row)
+
+        # ---- 模型预设列表 ----
+        presets_label = QLabel("模型预设列表（与上方下拉框实时联动，每行一个）:")
+        root.addWidget(presets_label)
+        edit_presets = QTextEdit()
+        edit_presets.setAcceptRichText(False)
+        edit_presets.setPlainText("\n".join(cfg.get("model_presets") or []))
+        edit_presets.setMaximumHeight(120)
+        edit_presets.setPlaceholderText("每行一个模型名，修改后会自动同步到上方下拉框")
+        root.addWidget(edit_presets)
+
+        def _sync_presets_to_combo():
+            """把预设文本框的内容同步到模型下拉框，保留当前选中项。"""
+            new_list = [x.strip() for x in edit_presets.toPlainText().splitlines() if x.strip()]
+            cur = cmb_model.currentText().strip()
+            cmb_model.blockSignals(True)
+            cmb_model.clear()
+            if new_list:
+                cmb_model.addItems(new_list)
+            if cur:
+                # 若当前项在列表中则选中；否则追加作为可编辑值保留
+                idx = cmb_model.findText(cur)
+                if idx >= 0:
+                    cmb_model.setCurrentIndex(idx)
+                else:
+                    cmb_model.setEditText(cur)
+            cmb_model.blockSignals(False)
+
+        edit_presets.textChanged.connect(_sync_presets_to_combo)
+
+        # ---- 提供商切换：自动填充 base_url / 模型列表 ----
+        def _on_provider_changed(idx):
+            key = cmb_provider.itemData(idx)
+            preset = AI_PROVIDER_PRESETS.get(key, {})
+            if not preset:
+                return
+            # 只有 base_url 等于当前提供商的默认值或为空时才自动填充
+            cur_base = edit_base.text().strip()
+            prev_preset = AI_PROVIDER_PRESETS.get(current_provider, {})
+            if not cur_base or cur_base == prev_preset.get("base_url", ""):
+                edit_base.setText(preset.get("base_url", ""))
+            # 切换模型预设列表
+            new_models = preset.get("models", [])
+            edit_presets.setPlainText("\n".join(new_models))
+            cmb_model.clear()
+            if new_models:
+                cmb_model.addItems(new_models)
+            default_model = preset.get("model", "")
+            if default_model:
+                cmb_model.setCurrentText(default_model)
+            # 若 API Key 为空或是旧提供商的默认值，自动填充新默认值
+            cur_key = edit_key.text().strip()
+            if not cur_key or cur_key == prev_preset.get("default_key", ""):
+                edit_key.setText(preset.get("default_key", ""))
+
+        cmb_provider.currentIndexChanged.connect(_on_provider_changed)
+
+        # ---- 对话测试组件 ----
+        test_group = QGroupBox("对话测试（测试当前表单中的配置，无需先保存）")
+        test_group.setStyleSheet("QGroupBox { font-weight: bold; margin-top: 8px; } "
+                                 "QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 4px; }")
+        test_lay = QVBoxLayout(test_group)
+
+        prompt_row = QHBoxLayout()
+        edit_test_prompt = QLineEdit()
+        edit_test_prompt.setPlaceholderText("输入测试提问，例如：你好，请用一句话介绍自己")
+        edit_test_prompt.setText("你好，请用一句话介绍自己")
+        prompt_row.addWidget(QLabel("提问:"), 0)
+        prompt_row.addWidget(edit_test_prompt, 1)
+        btn_test_chat = QPushButton("发送测试")
+        btn_test_chat.setMinimumWidth(90)
+        btn_test_chat.setToolTip("用当前表单中的 provider/base_url/api_key/model 发一次请求")
+        prompt_row.addWidget(btn_test_chat, 0)
+        test_lay.addLayout(prompt_row)
+
+        edit_test_result = QTextEdit()
+        edit_test_result.setReadOnly(True)
+        edit_test_result.setPlaceholderText("结果将在这里显示…")
+        edit_test_result.setMinimumHeight(110)
+        edit_test_result.setMaximumHeight(180)
+        test_lay.addWidget(edit_test_result)
+
+        root.addWidget(test_group)
+
+        def _on_test_chat():
+            """在后台线程用表单当前配置调用 AI，结果通过信号回主线程渲染。"""
+            base_url = edit_base.text().strip().rstrip("/")
+            api_key = edit_key.text().strip()
+            model = cmb_model.currentText().strip()
+            provider = cmb_provider.currentData()
+            prompt = edit_test_prompt.text().strip()
+            if not base_url:
+                edit_test_result.setPlainText("[错误] Base URL 为空")
+                return
+            if not api_key:
+                edit_test_result.setPlainText("[错误] API Key 为空")
+                return
+            if not model:
+                edit_test_result.setPlainText("[错误] 未选择模型")
+                return
+            if not prompt:
+                edit_test_result.setPlainText("[错误] 未输入提问")
+                return
+            if base_url and not base_url.endswith("/chat/completions"):
+                chat_url = f"{base_url}/chat/completions"
+            else:
+                chat_url = base_url
+
+            btn_test_chat.setEnabled(False)
+            btn_test_chat.setText("请求中...")
+            edit_test_result.setPlainText(
+                f"[请求] provider={provider}\n"
+                f"        url={chat_url}\n"
+                f"        model={model}\n"
+                f"        prompt={prompt}\n\n"
+                "等待响应…"
+            )
+
+            bridge = _NetTestBridge()  # 复用 (ok, msg) 信号签名
+
+            def _worker():
+                payload = {
+                    "model": model,
+                    "messages": [
+                        {"role": "system", "content": "你是一个有用的助手"},
+                        {"role": "user", "content": prompt},
+                    ],
+                }
+                req = urllib.request.Request(
+                    chat_url,
+                    data=json.dumps(payload).encode("utf-8"),
+                    headers={
+                        "Content-Type": "application/json",
+                        "Authorization": f"Bearer {api_key}",
+                    },
+                    method="POST",
+                )
+                t0 = time.time()
+                try:
+                    with _siliconflow_urlopen(req, 30) as resp:
+                        text = resp.read().decode("utf-8", errors="replace")
+                    data = json.loads(text)
+                    choices = data.get("choices") or []
+                    content = ""
+                    if choices:
+                        content = (
+                            choices[0].get("message", {}).get("content", "")
+                            or choices[0].get("delta", {}).get("content", "")
+                        ).strip()
+                    usage = data.get("usage") or {}
+                    elapsed = time.time() - t0
+                    if not content:
+                        bridge.finished.emit(False, f"AI 返回为空\n\n原始响应:\n{text[:800]}")
+                    else:
+                        usage_str = (
+                            f"tokens: prompt={usage.get('prompt_tokens', '?')} "
+                            f"completion={usage.get('completion_tokens', '?')} "
+                            f"total={usage.get('total_tokens', '?')}"
+                        )
+                        bridge.finished.emit(
+                            True,
+                            f"[成功] {elapsed:.2f}s  {usage_str}\n\n{content}",
+                        )
+                except urllib.error.HTTPError as e:
+                    body = ""
+                    try:
+                        body = e.read().decode("utf-8", errors="replace")[:600]
+                    except Exception:
+                        pass
+                    bridge.finished.emit(False, f"HTTPError {e.code}\n\n{body}")
+                except Exception as exc:
+                    bridge.finished.emit(False, f"{type(exc).__name__}: {exc}")
+
+            def _on_result(ok, message):
+                btn_test_chat.setEnabled(True)
+                btn_test_chat.setText("发送测试")
+                edit_test_result.setPlainText(message)
+                if ok:
+                    self._log(f"[ok] AI 模型测试成功: {model} @ {provider}")
+                else:
+                    self._log(f"[ERR] AI 模型测试失败: {model} -> {message.splitlines()[0]}")
+
+            bridge.finished.connect(_on_result)
+            # 避免 bridge 被 GC，挂到 dlg 上
+            dlg._chat_bridge = bridge  # type: ignore[attr-defined]
+            threading.Thread(target=_worker, daemon=True).start()
+
+        btn_test_chat.clicked.connect(_on_test_chat)
+
+        # ---- 底部按钮 ----
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        btn_save = QPushButton("保存")
+        btn_cancel = QPushButton("取消")
+        btn_row.addWidget(btn_save)
+        btn_row.addWidget(btn_cancel)
+        root.addLayout(btn_row)
+
+        def _on_save():
+            try:
+                provider = cmb_provider.currentData()
+                new_presets = [
+                    x.strip() for x in edit_presets.toPlainText().splitlines() if x.strip()
+                ]
+                payload = {
+                    "enabled": bool(chk_enabled.isChecked()),
+                    "provider": provider,
+                    "base_url": edit_base.text().strip(),
+                    "api_key": edit_key.text().strip(),
+                    "model": cmb_model.currentText().strip(),
+                    "model_presets": new_presets,
+                }
+                _save_ai_config(payload)
+                self._ai_config = payload
+                self._refresh_model_edit_from_config()
+                self._log(
+                    f"[ok] AI 模型配置已保存: provider={provider} "
+                    f"model={payload['model']} enabled={payload['enabled']}"
+                )
+                QMessageBox.information(
+                    self,
+                    "保存成功",
+                    f"AI 模型配置已保存到:\n{AI_CONFIG_FILE}\n\n"
+                    f"提供商: {provider}\n"
+                    f"模型: {payload['model']}\n"
+                    f"Base URL: {payload['base_url']}",
+                )
+                dlg.accept()
+            except Exception as exc:
+                self._log(f"[ERR] 保存 AI 配置失败: {exc}")
+                QMessageBox.warning(self, "保存失败", str(exc))
+
+        btn_save.clicked.connect(_on_save)
+        btn_cancel.clicked.connect(dlg.reject)
+
+        dlg.exec()
 
     def _check_github_auth(self):
         ok, msg = self._run(["gh", "auth", "status"])
@@ -556,7 +1362,11 @@ class RepoSyncWindow(QMainWindow):
             )
             if err_tcp:
                 lines.append(f"  {err_tcp}")
-            lines.append("[Git] 使用 http.version=HTTP/1.1（降低 SSL_ERROR_SYSCALL 概率）")
+            http_ver = self._get_configured_http_version()
+            if http_ver:
+                lines.append(f"[Git] 使用 http.version={http_ver}（来自网络设置）")
+            else:
+                lines.append("[Git] 使用默认 http.version（由 git 自动选择）")
             lines.append("")
             git_ok = True
             for idx, pkg in enumerate(("l_WChat", "l_repo_sync_gui")):
@@ -581,18 +1391,44 @@ class RepoSyncWindow(QMainWindow):
         self.btn_test_network.setEnabled(True)
         for line in report.splitlines():
             self._log(line)
-        if all_ok:
-            self._log("[ok] 网络连接测试全部通过")
-            QMessageBox.information(self, "网络连接测试", report)
-        else:
+
+        dlg = QMessageBox(self)
+        dlg.setWindowTitle("网络连接测试")
+        dlg.setIcon(QMessageBox.Information if all_ok else QMessageBox.Warning)
+        text = report
+        if not all_ok:
             self._log("[ERR] 网络连接测试存在失败项")
-            QMessageBox.warning(
-                self,
-                "网络连接测试",
-                report
-                + "\n\n部分检测失败。若仅个别仓库偶发 SSL_ERROR_SYSCALL，"
-                "多为间歇性连接问题，请重试测试或上传。",
+            text += (
+                "\n\n部分检测失败。若仅个别仓库偶发 SSL_ERROR_SYSCALL，"
+                "多为间歇性连接问题，请重试测试或上传。"
             )
+        else:
+            self._log("[ok] 网络连接测试全部通过")
+        dlg.setText(text)
+        dlg.setTextInteractionFlags(Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard)
+
+        btn_copy = dlg.addButton("复制结果", QMessageBox.ActionRole)
+        btn_close = dlg.addButton("关闭", QMessageBox.AcceptRole)
+        dlg.setDefaultButton(btn_close)
+
+        # 循环显示，支持多次点击「复制结果」
+        while True:
+            dlg.exec()
+            clicked = dlg.clickedButton()
+            if clicked is btn_copy:
+                try:
+                    QApplication.clipboard().setText(report)
+                    self._log("[ok] 测试报告已复制到剪贴板")
+                    # 短暂改变按钮文案给予反馈
+                    btn_copy.setText("✓ 已复制")
+                    # 延时后恢复按钮文案（使用 QTimer，避免 sleep 阻塞主线程）
+                    from PySide6.QtCore import QTimer
+                    QTimer.singleShot(1500, lambda: btn_copy.setText("复制结果"))
+                except Exception as exc:
+                    self._log(f"[ERR] 复制失败: {exc}")
+                continue
+            # 点击「关闭」或其他按钮则退出
+            break
 
     def _start_gh_auth_login(self):
         gh_exe = self._resolve_gh_executable()
@@ -682,13 +1518,131 @@ class RepoSyncWindow(QMainWindow):
         QApplication.processEvents()
         self._restore_list_scroll(scroll)
 
+    def _set_package_refresh_busy(self, busy: bool):
+        self._package_refresh_running = busy
+        self._set_busy(busy)
+        if self.btn_refresh_packages is not None:
+            self.btn_refresh_packages.setEnabled(not busy)
+
+    def _run_quiet(
+        self,
+        cmd: list[str],
+        cwd: Path | None = None,
+        safe_dir: Path | None = None,
+        *,
+        timeout: float = 120,
+    ) -> tuple[bool, str]:
+        """后台线程用：不写日志、不 pump 事件循环。"""
+        if not cmd:
+            return False, "empty command"
+
+        effective_cmd = list(cmd)
+        if cmd[0] == "git":
+            git_exe = self._resolve_git_executable()
+            if not git_exe:
+                return False, "git.exe not found"
+            repo_safe = safe_dir if safe_dir is not None else cwd
+            effective_cmd = [git_exe, *self._git_config_prefix(repo_safe), *cmd[1:]]
+        elif cmd[0] == "gh":
+            gh_exe = self._resolve_gh_executable()
+            if not gh_exe:
+                return False, "gh.exe not found"
+            effective_cmd[0] = gh_exe
+
+        run_env = os.environ.copy()
+        if cmd[0] == "git":
+            run_env["GIT_HTTP_CONNECT_TIMEOUT"] = str(GIT_HTTP_CONNECT_TIMEOUT_SEC)
+        gh_token = (self.gh_token_edit.text() or "").strip()
+        if gh_token:
+            run_env["GH_TOKEN"] = gh_token
+            run_env["GITHUB_TOKEN"] = gh_token
+        try:
+            proc = subprocess.run(
+                effective_cmd,
+                cwd=str(cwd) if cwd else None,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=run_env,
+                timeout=timeout,
+                check=False,
+            )
+        except Exception as exc:
+            return False, str(exc)
+
+        def _decode_output(data: bytes | None) -> str:
+            if not data:
+                return ""
+            for enc in ("utf-8", "gbk", sys.getdefaultencoding()):
+                try:
+                    return data.decode(enc)
+                except Exception:
+                    continue
+            return data.decode("utf-8", errors="replace")
+
+        out = _decode_output(proc.stdout).strip()
+        err = _decode_output(proc.stderr).strip()
+        merged = "\n".join(x for x in [out, err] if x)
+        if proc.returncode != 0:
+            return False, merged or f"exit code={proc.returncode}"
+        return True, merged
+
     def _log(self, text: str):
-        scroll = self._list_scroll_pos()
+        """输出日志到 GUI、终端和日志文件。"""
         now = datetime.datetime.now().strftime("%H:%M:%S")
-        self.log_edit.append(f"[{now}] {text}")
-        self.log_edit.ensureCursorVisible()
+        log_line = f"[{now}] {text}"
+
+        # 1. 输出到 GUI 日志组件（CodeEditorWidget 内部为 QPlainTextEdit）
+        scroll = self._list_scroll_pos()
+        inner = self.log_edit.editor()
+        inner.appendPlainText(log_line)
+        inner.ensureCursorVisible()
         QApplication.processEvents()
         self._restore_list_scroll(scroll)
+        
+        # 2. 输出到终端
+        print(log_line, flush=True)
+        
+        # 3. 写入日志文件
+        if hasattr(self, "_log_file_handler") and self._log_file_handler:
+            try:
+                self._log_file_handler.write(log_line + "\n")
+                self._log_file_handler.flush()
+            except Exception:
+                pass
+
+    def _init_log_file(self):
+        """初始化日志文件，按日期创建。"""
+        try:
+            log_dir = Path(os.environ.get("TEMP", ".")) / "l_repo_sync_gui" / "logs"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            today = datetime.datetime.now().strftime("%Y-%m-%d")
+            log_path = log_dir / f"sync_{today}.log"
+            self._log_file_handler = open(log_path, "a", encoding="utf-8")
+            self._log(f"日志文件: {log_path}")
+        except Exception as exc:
+            self._log_file_handler = None
+            print(f"[WARN] 无法创建日志文件: {exc}", file=sys.stderr)
+
+    def _log_phase_start(self, phase: str) -> str:
+        """记录阶段开始，返回 phase key 用于结束时计算耗时。"""
+        key = phase
+        if not hasattr(self, "_phase_timers"):
+            self._phase_timers: dict[str, float] = {}
+        self._phase_timers[key] = time.time()
+        self._log(f"\u25b6 {phase}")
+        return key
+
+    def _log_phase_end(self, phase: str, *, ok: bool = True):
+        """记录阶段结束，自动计算并显示耗时。"""
+        elapsed = ""
+        if hasattr(self, "_phase_timers") and phase in self._phase_timers:
+            dt = time.time() - self._phase_timers.pop(phase)
+            if dt >= 60:
+                elapsed = f" ({dt:.0f}s)"
+            else:
+                elapsed = f" ({dt:.2f}s)"
+        icon = "\u2713" if ok else "\u2717"
+        self._log(f"{icon} {phase}{elapsed}")
 
     @staticmethod
     def _git_config_prefix(repo_dir: Path | None = None) -> list[str]:
@@ -696,13 +1650,23 @@ class RepoSyncWindow(QMainWindow):
         args = [
             "-c",
             f"http.connectTimeout={GIT_HTTP_CONNECT_TIMEOUT_SEC}",
-            "-c",
-            "http.version=HTTP/1.1",
         ]
         if repo_dir is not None:
             safe_path = str(repo_dir.resolve()).replace("\\", "/")
             args.extend(["-c", f"safe.directory={safe_path}"])
         return args
+
+    def _get_configured_http_version(self) -> str:
+        """从网络配置文件中读取用户设置的 http.version（空字符串表示不强制）。"""
+        try:
+            if not NET_CONFIG_FILE.exists():
+                return ""
+            data = json.loads(NET_CONFIG_FILE.read_text(encoding="utf-8"))
+            if not data.get("enabled", False):
+                return ""
+            return (data.get("http_version") or "").strip()
+        except Exception:
+            return ""
 
     def _run(
         self,
@@ -855,6 +1819,58 @@ class RepoSyncWindow(QMainWindow):
         ]
         return True, names, ""
 
+    def _fetch_remote_repo_names_quiet(self, owner: str) -> tuple[bool, list[str], str]:
+        if not self._resolve_gh_executable(from_manual=False):
+            return False, [], "gh.exe not found"
+        ok, msg = self._run_quiet(
+            ["gh", "repo", "list", owner, "--limit", "1000", "--json", "name"]
+        )
+        if not ok:
+            return False, [], msg
+        try:
+            data = json.loads(msg or "[]")
+        except json.JSONDecodeError as exc:
+            return False, [], f"解析 gh repo list 失败: {exc}"
+        if not isinstance(data, list):
+            return False, [], "gh repo list 返回格式异常"
+        names = [
+            str(item.get("name", "")).strip()
+            for item in data
+            if isinstance(item, dict) and str(item.get("name", "")).strip()
+        ]
+        return True, names, ""
+
+    def _collect_full_package_data(
+        self, owner: str
+    ) -> tuple[list[tuple[str, Path, bool]], dict, list[str]]:
+        """后台收集包列表与 git 状态（不触碰 UI）。"""
+        warnings: list[str] = []
+        local = self._local_package_entries()
+        local_names = {name for name, _ in local}
+        entries: list[tuple[str, Path, bool]] = [
+            (name, path, False) for name, path in local
+        ]
+
+        self._package_refresh_bridge.log.emit("[阶段1] 获取远端仓库列表…")
+        ok, remote_names, err = self._fetch_remote_repo_names_quiet(owner)
+        if ok:
+            self._package_refresh_bridge.log.emit(f"[阶段1] 远端仓库数: {len(remote_names)}")
+            for name in sorted(set(remote_names), key=str.lower):
+                if name in local_names or name in SKIP_DIRS:
+                    continue
+                entries.append((name, self._remote_package_path(name), True))
+        elif self._resolve_gh_executable(from_manual=False):
+            warnings.append(f"[WARN] 获取远端仓库列表失败，仅显示本地包: {err}")
+
+        scannable = [(name, path) for name, path, remote_only in entries if not remote_only]
+        self._package_refresh_bridge.log.emit(f"[阶段2] 准备扫描 {len(scannable)} 个本地包")
+        if scannable:
+            self._prefetch_remotes_for_packages(scannable)
+        status_map = self._scan_all_package_status(
+            scannable, check_remote=True, fetch_remote=False
+        )
+        return entries, status_map, warnings
+
     def _package_entries(self) -> list[tuple[str, Path, bool]]:
         """本地包 + 远端有但本地无的仓库。"""
         local = self._local_package_entries()
@@ -887,6 +1903,412 @@ class RepoSyncWindow(QMainWindow):
         # XY 后若第 3 列是空格则为分隔符；否则 Y 为空白时路径紧跟在 index 2（如 "M wuwo.bat"）。
         path_part = line[3:] if line[2] == " " else line[2:]
         return xy, path_part
+
+    @staticmethod
+    def _is_diverged(sync: dict[str, int] | None) -> bool:
+        sync = sync or {}
+        return sync.get("ahead", 0) > 0 and sync.get("behind", 0) > 0
+
+    @staticmethod
+    def _read_text_file(path: Path, max_bytes: int = 512_000) -> str | None:
+        if not path.is_file():
+            return None
+        try:
+            data = path.read_bytes()
+            if len(data) > max_bytes or b"\x00" in data[:8192]:
+                return None
+            return data.decode("utf-8")
+        except Exception:
+            return None
+
+    def _git_name_only_set(self, pkg_dir: Path, rev_range: str) -> set[str]:
+        ok, msg = self._run(["git", "diff", "--name-only", rev_range], cwd=pkg_dir)
+        if not ok:
+            return set()
+        return {line.strip().replace("\\", "/") for line in (msg or "").splitlines() if line.strip()}
+
+    def _uncommitted_path_set(self, pkg_dir: Path) -> set[str]:
+        ok, status_lines = self._status_lines(pkg_dir)
+        paths: set[str] = set()
+        if not ok:
+            return paths
+        for raw in status_lines:
+            parsed = self._parse_porcelain_line(raw)
+            if not parsed:
+                continue
+            _, path_part = parsed
+            if not path_part:
+                continue
+            path = path_part.split(" -> ")[-1].strip().replace("\\", "/")
+            if path:
+                paths.add(path)
+        return paths
+
+    def _upstream_ref(self, pkg_dir: Path) -> str | None:
+        ok, upstream_raw = self._run(
+            ["git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"], cwd=pkg_dir
+        )
+        if not ok or not (upstream_raw or "").strip():
+            return None
+        return upstream_raw.strip().splitlines()[-1]
+
+    def _analyze_merge_plan(self, pkg_dir: Path) -> tuple[dict | None, str]:
+        """按 merge-base 划分：本地独有 / 远端独有 / 双方均改。"""
+        self._run(["git", "fetch", "--all", "--prune"], cwd=pkg_dir)
+        upstream = self._upstream_ref(pkg_dir)
+        if not upstream:
+            return None, "无上游分支"
+        ok_base, base_raw = self._run(["git", "merge-base", "HEAD", upstream], cwd=pkg_dir)
+        if not ok_base or not (base_raw or "").strip():
+            return None, "无法计算 merge-base（可能无共同历史）"
+        merge_base = base_raw.strip().splitlines()[-1]
+
+        local_files = self._git_name_only_set(pkg_dir, f"{merge_base}..HEAD")
+        local_files |= self._uncommitted_path_set(pkg_dir)
+        remote_files = self._git_name_only_set(pkg_dir, f"{merge_base}..{upstream}")
+
+        local_only = sorted(local_files - remote_files)
+        remote_only = sorted(remote_files - local_files)
+        both = sorted(local_files & remote_files)
+        return {
+            "upstream": upstream,
+            "merge_base": merge_base,
+            "local_only": local_only,
+            "remote_only": remote_only,
+            "both": both,
+        }, ""
+
+    def _preview_ai_merge(self, pkg_dir: Path) -> tuple[list[str], dict | None, str]:
+        plan, err = self._analyze_merge_plan(pkg_dir)
+        if plan is None:
+            return [f"[无法分析] {err}"], None, err
+        lines = [
+            f"[AI 合并预览] merge-base={plan['merge_base'][:8]}… upstream={plan['upstream']}",
+            "",
+            f"[保留本地] 仅本地改动 ({len(plan['local_only'])}):",
+        ]
+        lines.extend(plan["local_only"][:40] or ["(无)"])
+        if len(plan["local_only"]) > 40:
+            lines.append(f"...(共 {len(plan['local_only'])} 个)")
+        lines.extend(["", f"[取远端] 仅远端改动 ({len(plan['remote_only'])}):"])
+        lines.extend(plan["remote_only"][:40] or ["(无)"])
+        if len(plan["remote_only"]) > 40:
+            lines.append(f"...(共 {len(plan['remote_only'])} 个)")
+        lines.extend(["", f"[AI 合并] 双方均改 ({len(plan['both'])}):"])
+        lines.extend(plan["both"][:40] or ["(无)"])
+        if len(plan["both"]) > 40:
+            lines.append(f"...(共 {len(plan['both'])} 个)")
+        return lines, plan, ""
+
+    def _git_show_text(self, pkg_dir: Path, ref: str, relpath: str) -> str | None:
+        ok, msg = self._run(["git", "show", f"{ref}:{relpath}"], cwd=pkg_dir)
+        if not ok or msg is None:
+            return None
+        if "\x00" in msg:
+            return None
+        return msg
+
+    def _read_local_merge_text(self, pkg_dir: Path, relpath: str) -> str | None:
+        disk = self._read_text_file(pkg_dir / relpath)
+        if disk is not None:
+            return disk
+        return self._git_show_text(pkg_dir, "HEAD", relpath)
+
+    # ---- AI 配置辅助方法 ----
+    def _refresh_model_edit_from_config(self):
+        """根据 _ai_config 更新模型下拉框列表与当前选项。"""
+        cfg = getattr(self, "_ai_config", None) or {}
+        model_edit = self.model_edit
+        if not model_edit:
+            return
+        model_edit.clear()
+        presets = cfg.get("model_presets") or []
+        current = (cfg.get("model") or "").strip()
+        if current and current not in presets:
+            presets = [current, *presets]
+        if presets:
+            model_edit.addItems(presets)
+        if current:
+            model_edit.setCurrentText(current)
+        model_edit.setToolTip(f"当前模型: {current or '(未设置)'}\n点击“模型设置…”修改")
+
+    def _get_ai_endpoint(self) -> tuple[str, str, str]:
+        """从 _ai_config 获取 (chat_url, api_key, model)。"""
+        cfg = getattr(self, "_ai_config", None) or {}
+        base_url = (cfg.get("base_url") or "").rstrip("/")
+        api_key = (cfg.get("api_key") or "").strip()
+        model = (cfg.get("model") or "").strip()
+        if base_url and not base_url.endswith("/chat/completions"):
+            chat_url = f"{base_url}/chat/completions"
+        else:
+            chat_url = base_url or SILICONFLOW_URL
+        return chat_url, api_key, model
+
+    def _call_ai_text(
+        self, system: str, user: str, timeout: float = 90
+    ) -> tuple[bool, str]:
+        """通用 OpenAI 兼容 API 调用（支持 SiliconFlow / Zhipu / DeepSeek / 自定义）。"""
+        cfg = getattr(self, "_ai_config", None) or {}
+        if not cfg.get("enabled", True):
+            return False, "AI 模型已禁用（在“模型设置…”中启用）"
+        chat_url, api_key, model = self._get_ai_endpoint()
+        if not api_key:
+            return False, "未填写 AI API Key（在“模型设置…”中填写）"
+        if not chat_url:
+            return False, "未配置 Base URL（在“模型设置…”中填写）"
+        if not model:
+            return False, "未选择模型（在“模型设置…”中选择）"
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+        }
+        req = urllib.request.Request(
+            chat_url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {api_key}",
+            },
+            method="POST",
+        )
+        try:
+            # 国内提供商直连，避免误走系统代理
+            with _siliconflow_urlopen(req, timeout) as resp:
+                text = resp.read().decode("utf-8", errors="replace")
+            data = json.loads(text)
+            choices = data.get("choices") or []
+            content = ""
+            if choices:
+                content = (
+                    choices[0].get("message", {}).get("content", "")
+                    or choices[0].get("delta", {}).get("content", "")
+                ).strip()
+            if not content:
+                return False, f"AI 返回为空: {text[:200]}"
+            return True, content
+        except urllib.error.HTTPError as e:
+            body = ""
+            try:
+                body = e.read().decode("utf-8", errors="replace")[:400]
+            except Exception:
+                pass
+            return False, f"HTTPError {e.code}: {body}"
+        except Exception as exc:
+            return False, str(exc)
+
+    def _call_siliconflow_text(
+        self, system: str, user: str, timeout: float = 90
+    ) -> tuple[bool, str]:
+        # 保留兼容，内部转发到统一 _call_ai_text
+        return self._call_ai_text(system, user, timeout=timeout)
+
+
+    def _ai_merge_file_content(
+        self,
+        relpath: str,
+        local_text: str,
+        remote_text: str,
+        base_text: str = "",
+    ) -> tuple[bool, str]:
+        local_clip = local_text[:AI_MERGE_MAX_FILE_CHARS]
+        remote_clip = remote_text[:AI_MERGE_MAX_FILE_CHARS]
+        base_clip = (base_text or "")[:AI_MERGE_MAX_FILE_CHARS]
+        base_section = f"[共同祖先]\n{base_clip}\n\n" if base_clip else ""
+        prompt = (
+            f"文件路径: {relpath}\n\n"
+            "请合并「本地版」与「远端版」，输出合并后的完整文件内容。\n"
+            "规则：\n"
+            "1) 仅本地有的改动保留；仅远端有的改动采纳；双方都改的部分综合两者意图。\n"
+            "2) 只输出合并后的文件全文，不要解释、不要 markdown 代码块。\n"
+            "3) 保持原文件语言与风格。\n\n"
+            f"{base_section}"
+            f"[本地版]\n{local_clip}\n\n"
+            f"[远端版]\n{remote_clip}"
+        )
+        ok, content = self._call_siliconflow_text(
+            "你是代码合并专家，擅长三方合并并输出可直接保存的完整文件。",
+            prompt,
+            timeout=120,
+        )
+        if not ok:
+            return False, content
+        if content.startswith("```"):
+            lines = content.splitlines()
+            if lines and lines[0].startswith("```"):
+                lines = lines[1:]
+            if lines and lines[-1].strip() == "```":
+                lines = lines[:-1]
+            content = "\n".join(lines).strip()
+        return True, content
+
+    def _write_merged_file(self, pkg_dir: Path, relpath: str, content: str) -> bool:
+        target = pkg_dir / relpath
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content, encoding="utf-8", newline="\n")
+            return True
+        except Exception as exc:
+            self._log(f"[ERR] 写入 {relpath} 失败: {exc}")
+            return False
+
+    def _merge_head_exists(self, pkg_dir: Path) -> bool:
+        ok, _ = self._run(["git", "rev-parse", "-q", "--verify", "MERGE_HEAD"], cwd=pkg_dir)
+        return ok
+
+    def _abort_merge_if_needed(self, pkg_dir: Path):
+        if self._merge_head_exists(pkg_dir):
+            self._run(["git", "merge", "--abort"], cwd=pkg_dir)
+
+    def _git_show_stage(self, pkg_dir: Path, stage: int, relpath: str) -> str | None:
+        ok, msg = self._run(["git", "show", f":{stage}:{relpath}"], cwd=pkg_dir)
+        if not ok or msg is None or "\x00" in msg:
+            return None
+        return msg
+
+    def _read_merge_versions(
+        self, pkg_dir: Path, upstream: str, merge_base: str, relpath: str
+    ) -> tuple[str | None, str | None, str]:
+        base = self._git_show_stage(pkg_dir, 1, relpath)
+        if base is None:
+            base = self._git_show_text(pkg_dir, merge_base, relpath) or ""
+        ours = self._git_show_stage(pkg_dir, 2, relpath)
+        if ours is None:
+            ours = self._read_local_merge_text(pkg_dir, relpath)
+        theirs = self._git_show_stage(pkg_dir, 3, relpath)
+        if theirs is None:
+            theirs = self._git_show_text(pkg_dir, upstream, relpath)
+        return ours, theirs, base
+
+    def _checkout_merge_side(
+        self, pkg_dir: Path, side: str, upstream: str, relpath: str
+    ) -> tuple[bool, str]:
+        ok, msg = self._run(["git", "checkout", side, "--", relpath], cwd=pkg_dir)
+        if ok:
+            return True, msg
+        fallback_ref = "HEAD" if side == "--ours" else upstream
+        return self._run(["git", "checkout", fallback_ref, "--", relpath], cwd=pkg_dir)
+
+    def _execute_ai_merge(self, pkg_dir: Path, plan: dict) -> bool:
+        upstream = plan["upstream"]
+        merge_base = plan["merge_base"]
+        pkg_name = pkg_dir.name
+
+        self._abort_merge_if_needed(pkg_dir)
+        ok_merge, msg_merge = self._run(
+            ["git", "merge", upstream, "--no-commit", "--no-ff"], cwd=pkg_dir
+        )
+        if not self._merge_head_exists(pkg_dir) and not ok_merge:
+            self._log(f"[ERR] {pkg_name} 无法开始 merge: {msg_merge}")
+            QMessageBox.warning(self, "AI 合并失败", f"无法开始 merge:\n{msg_merge}")
+            return False
+
+        for relpath in plan["local_only"]:
+            ok, msg = self._checkout_merge_side(pkg_dir, "--ours", upstream, relpath)
+            if not ok:
+                self._abort_merge_if_needed(pkg_dir)
+                QMessageBox.warning(self, "AI 合并失败", f"保留本地失败:\n{relpath}\n{msg}")
+                return False
+            self._log(f"[merge] {relpath} ← 保留本地")
+
+        for relpath in plan["remote_only"]:
+            ok, msg = self._checkout_merge_side(pkg_dir, "--theirs", upstream, relpath)
+            if not ok:
+                self._abort_merge_if_needed(pkg_dir)
+                QMessageBox.warning(self, "AI 合并失败", f"取远端失败:\n{relpath}\n{msg}")
+                return False
+            self._log(f"[merge] {relpath} ← 远端")
+
+        for relpath in plan["both"]:
+            local_text, remote_text, base_text = self._read_merge_versions(
+                pkg_dir, upstream, merge_base, relpath
+            )
+            if local_text is None or remote_text is None:
+                self._log(f"[WARN] {relpath} 无法文本合并，保留本地")
+                self._checkout_merge_side(pkg_dir, "--ours", upstream, relpath)
+                continue
+            self._log(f"[merge] {relpath} … AI 合并中")
+            ok, merged = self._ai_merge_file_content(relpath, local_text, remote_text, base_text)
+            if not ok:
+                self._abort_merge_if_needed(pkg_dir)
+                QMessageBox.warning(self, "AI 合并失败", f"{relpath}:\n{merged}")
+                return False
+            if not self._write_merged_file(pkg_dir, relpath, merged):
+                self._abort_merge_if_needed(pkg_dir)
+                return False
+            self._log(f"[merge] {relpath} ✓ AI 合并完成")
+
+        self._run(["git", "add", "-A"], cwd=pkg_dir)
+        ok_diff, _ = self._run(["git", "diff", "--cached", "--quiet"], cwd=pkg_dir)
+        if ok_diff and not self._merge_head_exists(pkg_dir):
+            self._log(f"[info] {pkg_name} 合并后无 staged 变更")
+            return True
+        commit_msg = self._request_ai_commit_message(pkg_name, pkg_dir)
+        if not commit_msg:
+            commit_msg = (
+                f"merge: 同步本地与远端（AI 合并 {len(plan['both'])} 个文件）"
+            )
+        ok_commit, msg_commit = self._run(["git", "commit", "-m", commit_msg], cwd=pkg_dir)
+        if not ok_commit:
+            self._abort_merge_if_needed(pkg_dir)
+            self._log(f"[ERR] {pkg_name} 合并提交失败: {msg_commit}")
+            QMessageBox.warning(self, "AI 合并失败", f"提交失败:\n{msg_commit}")
+            return False
+        self._log(f"[ok] {pkg_name} AI 合并已提交，可点「上传」推送")
+        return True
+
+    def merge_one_ai(self, pkg_dir: Path):
+        pkg_name = pkg_dir.name
+        if not self._check_tools():
+            return
+        sync = self.package_sync_map.get(pkg_name, {})
+        if not self._is_diverged(sync):
+            QMessageBox.information(
+                self,
+                "无需合并",
+                f"{pkg_name} 当前不是「本地领先且远端领先」的分叉状态。",
+            )
+            return
+        if not (self._ai_config or {}).get("enabled", True) or not (self._ai_config or {}).get("api_key", "").strip():
+            QMessageBox.warning(self, "AI 合并", "请先在「模型设置…」中配置并启用 AI。")
+            return
+        self._set_busy(True)
+        try:
+            self._log(f"========== AI 合并 {pkg_name} ==========")
+            preview_lines, plan, err = self._preview_ai_merge(pkg_dir)
+            if plan is None:
+                self._log(f"[ERR] {pkg_name} 无法分析: {err}")
+                QMessageBox.warning(self, "AI 合并", err)
+                return
+            if not plan["remote_only"] and not plan["both"]:
+                QMessageBox.information(
+                    self,
+                    "AI 合并",
+                    f"{pkg_name} 无远端独有或双方均改的文件，可直接上传或下载。",
+                )
+                return
+            confirmed, _ = self._confirm_action(
+                "确认 AI 合并",
+                pkg_name,
+                preview_lines,
+                "无文件需要合并",
+                enable_ai=False,
+            )
+            if not confirmed:
+                self._log(f"[info] {pkg_name} 取消 AI 合并")
+                return
+            if not self._execute_ai_merge(pkg_dir, plan):
+                return
+            QMessageBox.information(
+                self,
+                "AI 合并完成",
+                f"{pkg_name} 已合并并提交。\n请点击「上传」推送到 GitHub。",
+            )
+        finally:
+            self._set_busy(False)
+            self._update_one_package_status(pkg_name, pkg_dir)
 
     @staticmethod
     def _summarize_status_counts(status_lines: list[str]) -> dict[str, int]:
@@ -988,16 +2410,258 @@ class RepoSyncWindow(QMainWindow):
             out.append("[本地未提交改动 diff]")
             out.extend(local_diff)
 
-    def _scan_package_status(self, pkg_dir: Path) -> tuple[bool, dict[str, int], str]:
-        """扫描单个包状态（给包列表统计使用，不写日志）。"""
+    def _fetch_package_remote(self, pkg_dir: Path) -> tuple[bool, str, str]:
+        """拉取单个仓库远端引用（供列表刷新使用）。
+
+        返回: (ok, err_kind, err_text)
+          - err_kind: "" 成功；"not_found" 仓库不存在；"network" 网络/代理异常；
+                      "no_remote" 无远端；"no_git" 非 git 仓库；"other" 其他失败
+          - err_text: 原始 stderr 摘要（仅失败时有值）
+        """
         if not (pkg_dir / ".git").is_dir():
-            return False, {}, "非git仓库"
+            return False, "no_git", ""
         git_exe = self._resolve_git_executable()
         if not git_exe:
-            return False, {}, "未找到git.exe"
+            return False, "other", "git.exe not found"
+        # 检查是否配置了 origin 远端
+        prefix = self._git_config_prefix(pkg_dir)
+        run_env = os.environ.copy()
+        run_env["GIT_HTTP_CONNECT_TIMEOUT"] = str(GIT_HTTP_CONNECT_TIMEOUT_SEC)
+        try:
+            url_proc = subprocess.run(
+                [git_exe, *prefix, "remote", "get-url", "origin"],
+                cwd=str(pkg_dir),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                env=run_env,
+                timeout=5,
+                check=False,
+            )
+            if url_proc.returncode != 0:
+                return False, "no_remote", ""
+        except Exception:
+            pass  # 继续尝试 fetch，由 fetch 结果决定
         try:
             proc = subprocess.run(
-                [git_exe, *self._git_config_prefix(pkg_dir), "status", "--porcelain"],
+                [git_exe, *prefix, "fetch", "--quiet", "--prune"],
+                cwd=str(pkg_dir),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=run_env,
+                timeout=GIT_FETCH_TIMEOUT_SEC,
+                check=False,
+            )
+            if proc.returncode == 0:
+                return True, "", ""
+            # 解码 stderr
+            def _dec(data: bytes | None) -> str:
+                if not data:
+                    return ""
+                for enc in ("utf-8", "gbk", sys.getdefaultencoding()):
+                    try:
+                        return data.decode(enc)
+                    except Exception:
+                        continue
+                return data.decode("utf-8", errors="replace")
+            err_text = _dec(proc.stderr).strip()
+            kind = self._classify_fetch_error(err_text)
+            return False, kind, err_text
+        except subprocess.TimeoutExpired:
+            return False, "network", "fetch timeout"
+        except Exception as exc:
+            return False, "other", str(exc)
+
+    @staticmethod
+    def _classify_fetch_error(err: str) -> str:
+        """将 git fetch 的 stderr 归类：not_found / network / reject / other。"""
+        low = (err or "").lower()
+        not_found_markers = [
+            "repository not found",
+            "does not appear to be a git repository",
+            "could not read from remote repository",
+            "not found",
+        ]
+        network_markers = [
+            "ssl_error_syscall",
+            "failed to connect",
+            "timed out",
+            "connection reset",
+            "connection aborted",
+            "eof",
+            "proxyerror",
+            "unable to access",
+            "tls handshake",
+        ]
+        reject_markers = [
+            "non-fast-forward",
+            "rejected",
+            "fetch first",
+            "permission denied",
+        ]
+        if any(m in low for m in not_found_markers):
+            return "not_found"
+        if any(m in low for m in network_markers):
+            return "network"
+        if any(m in low for m in reject_markers):
+            return "reject"
+        return "other"
+
+    def _prefetch_remotes_for_packages(self, package_entries: list[tuple[str, Path]]):
+        """有限并发 fetch，避免刷新状态时卡死。"""
+        if not package_entries:
+            return
+        total = len(package_entries)
+        self._package_refresh_bridge.log.emit(f"[阶段3] 并行 fetch 远端 ({total} 个包)")
+        t0 = time.time()
+        workers = max(1, min(REMOTE_FETCH_MAX_WORKERS, total))
+        done_count = 0
+        missing = []     # 仓库不存在的包
+        failed = []      # 其他原因失败的包
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {
+                executor.submit(self._fetch_package_remote, pkg_dir): name
+                for name, pkg_dir in package_entries
+            }
+            for future in concurrent.futures.as_completed(futures):
+                pkg_name = futures[future]
+                done_count += 1
+                try:
+                    ok, kind, err = future.result()
+                except Exception as exc:
+                    ok, kind, err = False, "other", str(exc)
+                if ok:
+                    icon = "✓"
+                    line = f"  {icon} fetch [{done_count}/{total}] {pkg_name}"
+                else:
+                    if kind == "not_found":
+                        icon = "✗(仓库不存在)"
+                        missing.append(pkg_name)
+                    elif kind == "network":
+                        icon = "✗(网络异常)"
+                        failed.append(pkg_name)
+                    elif kind == "no_remote":
+                        icon = "✗(未配置 origin)"
+                        missing.append(pkg_name)
+                    else:
+                        icon = "✗"
+                        failed.append(pkg_name)
+                    short_err = (err or "").splitlines()[-1][:80] if err else ""
+                    line = f"  {icon} fetch [{done_count}/{total}] {pkg_name}"
+                    if short_err:
+                        line += f"  ({short_err})"
+                self._package_refresh_bridge.log.emit(line)
+        elapsed = time.time() - t0
+        self._package_refresh_bridge.log.emit(f"[阶段3] fetch 完成 ({elapsed:.1f}s)")
+        if missing:
+            self._package_refresh_bridge.log.emit(
+                f"[提示] 以下 {len(missing)} 个包的远端仓库不存在（首次上传时程序会自动 gh repo create）："
+            )
+            for n in missing:
+                self._package_refresh_bridge.log.emit(f"  - {n}")
+        if failed:
+            self._package_refresh_bridge.log.emit(
+                f"[警告] 以下 {len(failed)} 个包 fetch 失败（网络/代理异常）："
+            )
+            for n in failed:
+                self._package_refresh_bridge.log.emit(f"  - {n}")
+
+    def _scan_sync_counts(
+        self, pkg_dir: Path, git_exe: str, *, fetch_remote: bool = False
+    ) -> dict[str, int]:
+        """对比上游分支，返回 ahead（本地领先）/ behind（远端领先）提交数。"""
+        sync = {"ahead": 0, "behind": 0}
+        prefix = self._git_config_prefix(pkg_dir)
+        run_env = os.environ.copy()
+        run_env["GIT_HTTP_CONNECT_TIMEOUT"] = str(GIT_HTTP_CONNECT_TIMEOUT_SEC)
+        try:
+            if fetch_remote:
+                subprocess.run(
+                    [git_exe, *prefix, "fetch", "--quiet", "--prune"],
+                    cwd=str(pkg_dir),
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    env=run_env,
+                    timeout=GIT_FETCH_TIMEOUT_SEC,
+                    check=False,
+                )
+            proc_up = subprocess.run(
+                [
+                    git_exe,
+                    *prefix,
+                    "rev-parse",
+                    "--abbrev-ref",
+                    "--symbolic-full-name",
+                    "@{u}",
+                ],
+                cwd=str(pkg_dir),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=10,
+                check=False,
+            )
+            if proc_up.returncode != 0 or not (proc_up.stdout or "").strip():
+                return sync
+            proc = subprocess.run(
+                [git_exe, *prefix, "rev-list", "--left-right", "--count", "HEAD...@{u}"],
+                cwd=str(pkg_dir),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=10,
+                check=False,
+            )
+            if proc.returncode != 0:
+                return sync
+            parts = (proc.stdout or "").strip().split()
+            if len(parts) == 2:
+                sync["ahead"] = max(0, int(parts[0]))
+                sync["behind"] = max(0, int(parts[1]))
+        except Exception:
+            pass
+        return sync
+
+    def _scan_package_status(
+        self, pkg_dir: Path, *, check_remote: bool = True, fetch_remote: bool = False
+    ) -> tuple[bool, dict[str, int], dict[str, int], str]:
+        """扫描单个包状态（给包列表统计使用，不写日志）。
+
+        优化：仅用一条 git status --porcelain=v2 --branch 同时获取
+        本地文件修改状态和 ahead/behind 信息，避免多次启动子进程。
+        """
+        empty_sync: dict[str, int] = {"ahead": 0, "behind": 0}
+        if not (pkg_dir / ".git").is_dir():
+            return False, {}, empty_sync, "非git仓库"
+        git_exe = self._resolve_git_executable()
+        if not git_exe:
+            return False, {}, empty_sync, "未找到git.exe"
+
+        # 可选：先 fetch 远端
+        if fetch_remote:
+            run_env = os.environ.copy()
+            run_env["GIT_HTTP_CONNECT_TIMEOUT"] = str(GIT_HTTP_CONNECT_TIMEOUT_SEC)
+            try:
+                subprocess.run(
+                    [git_exe, *self._git_config_prefix(pkg_dir), "fetch", "--quiet", "--prune"],
+                    cwd=str(pkg_dir),
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    env=run_env,
+                    timeout=GIT_FETCH_TIMEOUT_SEC,
+                    check=False,
+                )
+            except Exception:
+                pass
+
+        # 一条命令同时拿到分支信息 + 文件状态
+        cmd = [git_exe, *self._git_config_prefix(pkg_dir), "status", "--porcelain=v2", "--branch"]
+        try:
+            proc = subprocess.run(
+                cmd,
                 cwd=str(pkg_dir),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -1008,21 +2672,79 @@ class RepoSyncWindow(QMainWindow):
                 check=False,
             )
         except Exception as exc:
-            return False, {}, f"扫描失败: {exc}"
+            return False, {}, empty_sync, f"扫描失败: {exc}"
 
         if proc.returncode != 0:
             err = (proc.stderr or "").strip() or f"exit code={proc.returncode}"
-            return False, {}, f"扫描失败: {err}"
+            return False, {}, empty_sync, f"扫描失败: {err}"
 
-        status_lines = [line for line in (proc.stdout or "").splitlines() if line.strip()]
-        return True, self._summarize_status_counts(status_lines), ""
+        sync = dict(empty_sync)
+        counts = {
+            "modified": 0, "untracked": 0, "conflicted": 0,
+            "deleted": 0, "renamed": 0, "staged": 0,
+        }
+
+        for raw_line in (proc.stdout or "").splitlines():
+            line = raw_line.rstrip()
+            if not line:
+                continue
+
+            # 分支头信息：# branch.ab +N -M
+            if line.startswith("# branch.ab "):
+                if check_remote:
+                    parts = line.split()
+                    for p in parts:
+                        if p.startswith("+"):
+                            try:
+                                sync["ahead"] = max(0, int(p))
+                            except ValueError:
+                                pass
+                        elif p.startswith("-"):
+                            try:
+                                sync["behind"] = max(0, abs(int(p)))
+                            except ValueError:
+                                pass
+                continue
+
+            # 跳过其他 # 开头的分支元信息行
+            if line.startswith("# "):
+                continue
+
+            # 未跟踪文件
+            if line.startswith("? "):
+                counts["untracked"] += 1
+                continue
+
+            # v2 格式普通条目: "1 XY ..." 或重命名: "2 XY ..."
+            if line.startswith("1 ") or line.startswith("2 "):
+                xy = line[2:4] if len(line) >= 4 else ".."
+                x, y = xy[0], xy[1]
+                if "U" in (x, y) or (x == "A" and y == "A") or (x == "D" and y == "D"):
+                    counts["conflicted"] += 1
+                else:
+                    if x not in (".", "?"):
+                        counts["staged"] += 1
+                    if y == "M":
+                        counts["modified"] += 1
+                    elif y == "D":
+                        counts["deleted"] += 1
+                    if x == "R" or (line.startswith("2 ")):
+                        counts["renamed"] += 1
+                continue
+
+            # 冲突条目: "u XY ..."
+            if line.startswith("u "):
+                counts["conflicted"] += 1
+                continue
+
+        return True, counts, sync, ""
 
     @staticmethod
-    def _format_package_status_suffix(counts: dict[str, int], err: str) -> str:
+    def _format_package_status_suffix(
+        counts: dict[str, int], err: str, sync: dict[str, int] | None = None
+    ) -> str:
         if err:
             return f" [{err}]"
-        if not counts:
-            return ""
         parts: list[str] = []
         if counts.get("modified", 0):
             parts.append(f"修改{counts['modified']}")
@@ -1036,6 +2758,13 @@ class RepoSyncWindow(QMainWindow):
             parts.append(f"重命名{counts['renamed']}")
         if counts.get("conflicted", 0):
             parts.append(f"冲突{counts['conflicted']}")
+        sync = sync or {}
+        if sync.get("ahead", 0) and sync.get("behind", 0):
+            parts.append("分叉")
+        if sync.get("behind", 0):
+            parts.append(f"远端领先{sync['behind']}")
+        if sync.get("ahead", 0):
+            parts.append(f"本地领先{sync['ahead']}")
         if not parts:
             return " [干净]"
         return f" [{' / '.join(parts)}]"
@@ -1043,50 +2772,232 @@ class RepoSyncWindow(QMainWindow):
     def _scan_all_package_status(
         self,
         package_entries: list[tuple[str, Path]],
-    ) -> dict[str, tuple[dict[str, int], str]]:
-        status_map: dict[str, tuple[dict[str, int], str]] = {}
+        *,
+        check_remote: bool = True,
+        fetch_remote: bool = False,
+    ) -> dict[str, tuple[dict[str, int], dict[str, int], str]]:
+        status_map: dict[str, tuple[dict[str, int], dict[str, int], str]] = {}
         if not package_entries:
             return status_map
+        self._package_refresh_bridge.log.emit(f"[阶段4] 并行扫描 {len(package_entries)} 个包")
         max_workers = max(1, min(8, (os.cpu_count() or 4), len(package_entries)))
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {
-                executor.submit(self._scan_package_status, pkg_dir): pkg_name
-                for pkg_name, pkg_dir in package_entries
-            }
+            futures = {}
+            scan_start_times = {}
+            for pkg_name, pkg_dir in package_entries:
+                scan_start_times[pkg_name] = time.time()
+                self._package_refresh_bridge.log.emit(f"▶ 扫描 {pkg_name}")
+                futures[executor.submit(
+                    self._scan_package_status,
+                    pkg_dir,
+                    check_remote=check_remote,
+                    fetch_remote=fetch_remote,
+                )] = pkg_name
             for future in concurrent.futures.as_completed(futures):
                 pkg_name = futures[future]
+                elapsed = time.time() - scan_start_times.get(pkg_name, time.time())
+                elapsed_str = f"{elapsed:.2f}s" if elapsed < 60 else f"{elapsed:.0f}s"
                 try:
-                    ok, counts, err = future.result()
+                    ok, counts, sync, err = future.result()
                 except Exception as exc:
-                    ok, counts, err = False, {}, f"扫描失败: {exc}"
-                status_map[pkg_name] = (counts if ok else {}, "" if ok else err)
-                QApplication.processEvents()
+                    ok, counts, sync, err = False, {}, {"ahead": 0, "behind": 0}, f"扫描失败: {exc}"
+                status_map[pkg_name] = (
+                    (counts if ok else {}),
+                    sync if ok else {"ahead": 0, "behind": 0},
+                    "" if ok else err,
+                )
+                icon = "✓" if ok else "✗"
+                self._package_refresh_bridge.log.emit(f"{icon} 扫描 {pkg_name} ({elapsed_str})")
         return status_map
 
-    def _apply_package_status_map(self, status_map: dict[str, tuple[dict[str, int], str]]):
+    def _style_package_status_label(self, label: QLabel, sync: dict[str, int]):
+        if self._is_diverged(sync):
+            label.setStyleSheet("font-size: 12px; color: #9333ea; font-weight: bold;")
+        elif sync.get("behind", 0):
+            label.setStyleSheet("font-size: 12px; color: #d97706;")
+        elif sync.get("ahead", 0):
+            label.setStyleSheet("font-size: 12px; color: #2563eb;")
+        else:
+            label.setStyleSheet("font-size: 12px;")
+
+    def _apply_package_status_map(
+        self, status_map: dict[str, tuple[dict[str, int], dict[str, int], str]]
+    ):
         for pkg_name, _ in self.package_entries:
             label = self.package_status_labels.get(pkg_name)
             if label is None:
                 continue
-            counts, err = status_map.get(pkg_name, ({}, ""))
-            label.setText(f"{pkg_name}{self._format_package_status_suffix(counts, err)}")
+            counts, sync, err = status_map.get(pkg_name, ({}, {"ahead": 0, "behind": 0}, ""))
+            label.setText(f"{pkg_name}{self._format_package_status_suffix(counts, err, sync)}")
+            self._style_package_status_label(label, sync)
+            if not err:
+                self.package_sync_map[pkg_name] = sync
+        self._update_merge_buttons()
+
+    def _update_merge_buttons(self):
+        for pkg_name, btn in self.package_merge_buttons.items():
+            sync = self.package_sync_map.get(pkg_name, {})
+            diverged = self._is_diverged(sync)
+            btn.setEnabled(diverged)
+
+    def _update_one_package_status(self, pkg_name: str, pkg_dir: Path):
+        """后台线程刷新单包状态，完成后通过信号回调更新 UI。"""
+        refresh_btn = self.package_refresh_buttons.get(pkg_name)
+        if refresh_btn is not None:
+            refresh_btn.setEnabled(False)
+        self._log_phase_start(f"扫描 {pkg_name}")
+
+        def _worker():
+            ok, counts, sync, err = self._scan_package_status(
+                pkg_dir, check_remote=True, fetch_remote=False
+            )
+            self._package_refresh_bridge.one_ready.emit(
+                pkg_name, ok, counts, sync, err
+            )
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_one_package_status_ready(
+        self, pkg_name: str, ok: bool, counts: object, sync: object, err: str
+    ):
+        """单包状态后台扫描完成的主线程回调。"""
+        scroll = self._list_scroll_pos()
+        label = self.package_status_labels.get(pkg_name)
+        if label is not None:
+            label.setText(
+                f"{pkg_name}{self._format_package_status_suffix(counts if ok else {}, err, sync if ok else {})}"
+            )
+            self._style_package_status_label(label, sync if ok else {})
+            if ok:
+                self.package_sync_map[pkg_name] = sync
+        merge_btn = self.package_merge_buttons.get(pkg_name)
+        if merge_btn is not None:
+            merge_btn.setEnabled(ok and self._is_diverged(sync))
+        refresh_btn = self.package_refresh_buttons.get(pkg_name)
+        if refresh_btn is not None:
+            refresh_btn.setEnabled(True)
+        self._log_phase_end(f"扫描 {pkg_name}", ok=ok)
+        self._restore_list_scroll(scroll)
+        self._log(f"已更新 {pkg_name} 状态。")
+
+    def _open_package_in_browser(self, pkg_name: str):
+        """用默认浏览器打开包对应的 GitHub 仓库页面。"""
+        owner = (self.owner_edit.text().strip() if self.owner_edit else "") or "Lugwit123"
+        url = f"https://github.com/{owner}/{pkg_name}"
+        self._log(f"[info] 在浏览器中打开: {url}")
+        try:
+            webbrowser.open(url)
+        except Exception as exc:
+            self._log(f"[ERR] 打开浏览器失败: {exc}")
+            QMessageBox.warning(self, "打开浏览器失败", str(exc))
 
     def refresh_package_status(self):
         if not self.package_entries:
-            self.refresh_packages()
+            self._start_package_list_refresh()
+            return
+        if self._package_refresh_running:
+            return
+        scannable = [
+            (name, path) for name, path, remote_only in self.package_entries if not remote_only
+        ]
+        if not scannable:
+            return
+        self._package_refresh_token += 1
+        token = self._package_refresh_token
+        self._set_package_refresh_busy(True)
+        self._log_phase_start("刷新包状态")
+        self._log("正在后台刷新包 git 状态…")
+
+        def _worker():
+            try:
+                status_map = self._scan_all_package_status(
+                    scannable, check_remote=True, fetch_remote=False
+                )
+                self._package_refresh_bridge.status_ready.emit(token, status_map)
+            except Exception as exc:
+                self._package_refresh_bridge.failed.emit(token, str(exc))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def refresh_packages(self):
+        self._start_package_list_refresh()
+
+    def _start_package_list_refresh(self):
+        if self._package_refresh_running:
+            return
+        self._package_refresh_token += 1
+        token = self._package_refresh_token
+        self._set_package_refresh_busy(True)
+        local_entries = [(name, path, False) for name, path in self._local_package_entries()]
+        self._render_package_list(local_entries, {}, loading=True)
+        owner = self.owner_edit.text().strip() or "Lugwit123"
+        self._log_phase_start("加载包列表")
+        self._log("正在后台加载包列表与 git 状态…")
+
+        def _worker():
+            try:
+                entries, status_map, warnings = self._collect_full_package_data(owner)
+                self._package_refresh_bridge.list_ready.emit(
+                    token, entries, status_map, warnings
+                )
+            except Exception as exc:
+                self._package_refresh_bridge.failed.emit(token, str(exc))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_package_list_ready(
+        self,
+        token: int,
+        package_entries: list,
+        status_map: dict,
+        warnings: list,
+    ):
+        if token != self._package_refresh_token:
+            return
+        self._render_package_list(package_entries, status_map)
+        for line in warnings:
+            self._log(line)
+        local_count = sum(1 for _, _, remote_only in package_entries if not remote_only)
+        remote_count = len(package_entries) - local_count
+        if remote_count:
+            self._log(
+                f"已加载 {local_count} 个本地包、{remote_count} 个仅远端仓库（状态已并行扫描）。"
+            )
+        else:
+            self._log(f"已加载 {local_count} 个包（状态已并行扫描）。")
+        self._log_phase_end("加载包列表")
+        self._set_package_refresh_busy(False)
+
+    def _on_package_status_ready(self, token: int, status_map: dict):
+        if token != self._package_refresh_token:
             return
         scroll = self._list_scroll_pos()
-        self._log("正在刷新包 git 状态…")
-        scannable = [(name, path) for name, path, remote_only in self.package_entries if not remote_only]
-        status_map = self._scan_all_package_status(scannable)
         self._apply_package_status_map(status_map)
         self._restore_list_scroll(scroll)
-        local_count = sum(1 for _, _, remote_only in self.package_entries if not remote_only)
+        local_count = sum(
+            1 for _, _, remote_only in self.package_entries if not remote_only
+        )
         remote_count = len(self.package_entries) - local_count
         extra = f"，其中 {remote_count} 个仅远端" if remote_count else ""
         self._log(f"已刷新 {local_count} 个本地包的状态{extra}。")
+        self._log_phase_end("刷新包状态")
+        self._set_package_refresh_busy(False)
 
-    def refresh_packages(self):
+    def _on_package_refresh_failed(self, token: int, message: str):
+        if token != self._package_refresh_token:
+            return
+        self._log(f"[ERR] 包列表刷新失败: {message}")
+        self._log_phase_end("加载包列表", ok=False)
+        self._log_phase_end("刷新包状态", ok=False)
+        self._set_package_refresh_busy(False)
+
+    def _render_package_list(
+        self,
+        package_entries: list[tuple[str, Path, bool]],
+        status_map: dict,
+        *,
+        loading: bool = False,
+    ):
         while self.list_layout.count():
             child = self.list_layout.takeAt(0)
             w = child.widget()
@@ -1094,10 +3005,10 @@ class RepoSyncWindow(QMainWindow):
                 w.deleteLater()
         self.row_buttons = []
         self.package_status_labels = {}
-        package_entries = self._package_entries()
+        self.package_sync_map = {}
+        self.package_merge_buttons = {}
+        self.package_refresh_buttons = {}
         self.package_entries = package_entries
-        scannable = [(name, path) for name, path, remote_only in package_entries if not remote_only]
-        status_map = self._scan_all_package_status(scannable)
         remote_section_started = False
 
         for pkg_name, pkg_dir, remote_only in package_entries:
@@ -1120,18 +3031,27 @@ class RepoSyncWindow(QMainWindow):
 
             if remote_only:
                 status_text = " [仅远端]"
+                label = QLabel(f"{pkg_name}{status_text}")
+                label.setStyleSheet("font-size: 12px;")
+            elif loading and pkg_name not in status_map:
+                label = QLabel(f"{pkg_name} [扫描中…]")
+                label.setStyleSheet("font-size: 12px; color: #9aa0a6;")
             else:
-                counts, err = status_map.get(pkg_name, ({}, ""))
-                status_text = self._format_package_status_suffix(counts, err)
-            label = QLabel(f"{pkg_name}{status_text}")
-            label.setStyleSheet("font-size: 12px;")
+                counts, sync, err = status_map.get(pkg_name, ({}, {"ahead": 0, "behind": 0}, ""))
+                status_text = self._format_package_status_suffix(counts, err, sync)
+                label = QLabel(f"{pkg_name}{status_text}")
+                self._style_package_status_label(label, sync)
+                if not err:
+                    self.package_sync_map[pkg_name] = sync
             label.setMinimumWidth(200)
             row_lay.addWidget(label, 1)
             self.package_status_labels[pkg_name] = label
 
+            row_busy = loading and self._package_refresh_running
+
             btn_up = QPushButton("上传")
             btn_up.setFocusPolicy(Qt.NoFocus)
-            btn_up.setStyleSheet(self._row_button_style)
+            btn_up.setProperty("class", "row-btn")
             btn_up.setMinimumHeight(20)
             btn_up.setMaximumWidth(58)
             if remote_only:
@@ -1139,22 +3059,50 @@ class RepoSyncWindow(QMainWindow):
                 btn_up.setToolTip("本地尚无此仓库，请先下载")
             else:
                 btn_up.clicked.connect(lambda _=False, p=pkg_dir: self.upload_one(p))
+            if row_busy:
+                btn_up.setEnabled(False)
             row_lay.addWidget(btn_up)
             self.row_buttons.append(btn_up)
 
             btn_down = QPushButton("下载")
             btn_down.setFocusPolicy(Qt.NoFocus)
-            btn_down.setStyleSheet(self._row_button_style)
+            btn_down.setProperty("class", "row-btn")
             btn_down.setMinimumHeight(20)
             btn_down.setMaximumWidth(58)
             btn_down.clicked.connect(lambda _=False, p=pkg_dir: self.download_one(p))
+            if row_busy:
+                btn_down.setEnabled(False)
             row_lay.addWidget(btn_down)
             self.row_buttons.append(btn_down)
+
+            diverged = (not remote_only) and self._is_diverged(
+                self.package_sync_map.get(pkg_name, {})
+            )
+            btn_merge = QPushButton("AI合并")
+            btn_merge.setFocusPolicy(Qt.NoFocus)
+            btn_merge.setProperty("class", "merge-btn")
+            btn_merge.setMinimumHeight(20)
+            btn_merge.setMaximumWidth(64)
+            btn_merge.setToolTip(
+                "本地独有→保留本地；远端独有→取远端；双方都改→AI 合并后提交"
+            )
+            if remote_only or not diverged:
+                btn_merge.setEnabled(False)
+                if not remote_only:
+                    btn_merge.setToolTip("需同时「本地领先」且「远端领先」（分叉）时可用")
+            else:
+                btn_merge.clicked.connect(lambda _=False, p=pkg_dir: self.merge_one_ai(p))
+            if row_busy:
+                btn_merge.setEnabled(False)
+            row_lay.addWidget(btn_merge)
+            self.row_buttons.append(btn_merge)
+            if not remote_only:
+                self.package_merge_buttons[pkg_name] = btn_merge
 
             local_exists = pkg_dir.exists()
             btn_del_local = QPushButton("删本地")
             btn_del_local.setFocusPolicy(Qt.NoFocus)
-            btn_del_local.setStyleSheet(self._row_button_style)
+            btn_del_local.setProperty("class", "row-btn")
             btn_del_local.setMinimumHeight(20)
             btn_del_local.setMaximumWidth(58)
             if remote_only or not local_exists:
@@ -1163,35 +3111,61 @@ class RepoSyncWindow(QMainWindow):
             else:
                 btn_del_local.setToolTip("永久删除本地目录")
                 btn_del_local.clicked.connect(lambda _=False, p=pkg_dir: self.delete_local_one(p))
+            if row_busy:
+                btn_del_local.setEnabled(False)
             row_lay.addWidget(btn_del_local)
             self.row_buttons.append(btn_del_local)
 
             btn_del_remote = QPushButton("删远端")
             btn_del_remote.setFocusPolicy(Qt.NoFocus)
-            btn_del_remote.setStyleSheet(self._row_button_style)
+            btn_del_remote.setProperty("class", "row-btn")
             btn_del_remote.setMinimumHeight(20)
             btn_del_remote.setMaximumWidth(58)
             btn_del_remote.setToolTip("永久删除 GitHub 仓库")
             btn_del_remote.clicked.connect(lambda _=False, p=pkg_dir: self.delete_remote_one(p))
+            if row_busy:
+                btn_del_remote.setEnabled(False)
             row_lay.addWidget(btn_del_remote)
             self.row_buttons.append(btn_del_remote)
+
+            btn_refresh = QPushButton("刷新")
+            btn_refresh.setFocusPolicy(Qt.NoFocus)
+            btn_refresh.setProperty("class", "refresh-btn")
+            btn_refresh.setMinimumHeight(20)
+            btn_refresh.setMaximumWidth(46)
+            btn_refresh.setToolTip("刷新此包的 git 状态")
+            if remote_only:
+                btn_refresh.setEnabled(False)
+            else:
+                btn_refresh.clicked.connect(
+                    lambda _=False, n=pkg_name, p=pkg_dir: self._update_one_package_status(n, p)
+                )
+            if row_busy:
+                btn_refresh.setEnabled(False)
+            row_lay.addWidget(btn_refresh)
+            self.row_buttons.append(btn_refresh)
+            if not remote_only:
+                self.package_refresh_buttons[pkg_name] = btn_refresh
+
+            btn_web = QPushButton("网页")
+            btn_web.setFocusPolicy(Qt.NoFocus)
+            btn_web.setProperty("class", "row-btn")
+            btn_web.setMinimumHeight(20)
+            btn_web.setMaximumWidth(46)
+            owner = (self.owner_edit.text().strip() if self.owner_edit else "") or "Lugwit123"
+            btn_web.setToolTip(f"在浏览器中打开 https://github.com/{owner}/{pkg_name}")
+            btn_web.clicked.connect(
+                lambda _=False, n=pkg_name: self._open_package_in_browser(n)
+            )
+            row_lay.addWidget(btn_web)
+            self.row_buttons.append(btn_web)
 
             self.list_layout.addWidget(row)
             sep = QFrame()
             sep.setFrameShape(QFrame.HLine)
             sep.setFrameShadow(QFrame.Plain)
             sep.setFixedHeight(2)
-            sep.setStyleSheet("color: #5a5a62; margin: 0px; padding: 0px;")
             self.list_layout.addWidget(sep)
-
-        local_count = sum(1 for _, _, remote_only in package_entries if not remote_only)
-        remote_count = len(package_entries) - local_count
-        if remote_count:
-            self._log(
-                f"已加载 {local_count} 个本地包、{remote_count} 个仅远端仓库（状态已并行扫描）。"
-            )
-        else:
-            self._log(f"已加载 {local_count} 个包（状态已并行扫描）。")
 
     def _ensure_git_repo(self, pkg_dir: Path) -> bool:
         if (pkg_dir / ".git").is_dir():
@@ -1785,10 +3759,14 @@ class RepoSyncWindow(QMainWindow):
         on_chunk,
     ) -> tuple[bool, str]:
         """流式请求 AI 详细分析，实时回调输出。"""
-        api_key = self.api_key_edit.text().strip()
+        cfg = self._ai_config or {}
+        if not cfg.get("enabled", True):
+            return False, "AI 模型已禁用，请在「模型设置…」中启用"
+        chat_url, api_key, model = self._get_ai_endpoint()
         if not api_key:
-            return False, "未填写 AI Key，无法生成详细分析"
-        model = self.model_edit.currentText().strip() or DEFAULT_SILICONFLOW_MODEL
+            return False, "未填写 AI API Key，无法生成详细分析"
+        if not chat_url:
+            return False, "未配置 Base URL，无法生成详细分析"
         payload = {
             "model": model,
             "stream": True,
@@ -1798,7 +3776,7 @@ class RepoSyncWindow(QMainWindow):
             ],
         }
         req = urllib.request.Request(
-            SILICONFLOW_URL,
+            chat_url,
             data=json.dumps(payload).encode("utf-8"),
             headers={
                 "Content-Type": "application/json",
@@ -1997,6 +3975,7 @@ class RepoSyncWindow(QMainWindow):
         self._set_busy(True)
         try:
             self._log(f"========== 上传 {pkg_name} ==========")
+            self._log_phase_start(f"上传 {pkg_name}")
             if not self._ensure_git_repo(pkg_dir):
                 return
             self._ensure_gitignore(pkg_dir)
@@ -2131,8 +4110,9 @@ class RepoSyncWindow(QMainWindow):
                 return
             self._try_create_github_repo_and_push(pkg_dir, pkg_name, owner, branch)
         finally:
+            self._log_phase_end(f"上传 {pkg_name}")
             self._set_busy(False)
-            self.refresh_package_status()
+            self._update_one_package_status(pkg_name, pkg_dir)
 
     def download_one(self, pkg_dir: Path):
         owner = self.owner_edit.text().strip() or "Lugwit123"
@@ -2143,6 +4123,7 @@ class RepoSyncWindow(QMainWindow):
         cloned_new_repo = False
         try:
             self._log(f"========== 下载 {pkg_name} ==========")
+            self._log_phase_start(f"下载 {pkg_name}")
             if not pkg_dir.exists():
                 pkg_dir.parent.mkdir(parents=True, exist_ok=True)
                 ok_clone, msg_clone = self._run(
@@ -2181,11 +4162,12 @@ class RepoSyncWindow(QMainWindow):
                 self._log(f"[info] {pkg_name} 用户取消强制下载")
                 QMessageBox.warning(self, "下载失败", f"{pkg_name} pull 失败:\n{msg_pull}")
         finally:
+            self._log_phase_end(f"下载 {pkg_name}")
             self._set_busy(False)
             if cloned_new_repo:
                 self.refresh_packages()
             else:
-                self.refresh_package_status()
+                self._update_one_package_status(pkg_name, pkg_dir)
 
     def delete_local_one(self, pkg_dir: Path):
         pkg_name = pkg_dir.name
@@ -2279,21 +4261,185 @@ class RepoSyncWindow(QMainWindow):
             self.download_one(pkg_dir)
 
     def restart_self(self):
+        """重启程序，过程中显示进度弹窗，成功后自动关闭，失败保留弹窗显示错误。"""
+        import shlex
+
+        # ---- 1. 构建重启命令 ----
+        cmd_list = [sys.executable, *sys.argv]
         try:
-            subprocess.Popen([sys.executable, *sys.argv])
+            cmd_display = shlex.join(cmd_list)
+        except Exception:
+            cmd_display = " ".join(str(x) for x in cmd_list)
+
+        # ---- 2. 构建重启进度弹窗 ----
+        dlg = QDialog(self)
+        dlg.setWindowTitle("正在重启 l_repo_sync_gui")
+        dlg.setMinimumWidth(560)
+        dlg.setModal(True)
+        dlg.setWindowFlags(
+            dlg.windowFlags()
+            & ~Qt.WindowContextHelpButtonHint
+            & ~Qt.WindowCloseButtonHint
+        )
+
+        lay = QVBoxLayout(dlg)
+
+        lbl_title = QLabel("🔄 重启 l_repo_sync_gui")
+        title_font = lbl_title.font()
+        title_font.setPointSize(title_font.pointSize() + 2)
+        title_font.setBold(True)
+        lbl_title.setFont(title_font)
+        lay.addWidget(lbl_title)
+
+        lay.addWidget(QLabel("重启命令:"))
+        cmd_view = QTextEdit()
+        cmd_view.setReadOnly(True)
+        cmd_view.setPlainText(cmd_display)
+        cmd_view.setMaximumHeight(80)
+        cmd_view.setStyleSheet(
+            "QTextEdit { background:#1e1e1e; color:#d4d4d4; "
+            "font-family: Consolas, 'Courier New', monospace; padding:6px; }"
+        )
+        lay.addWidget(cmd_view)
+
+        lbl_status = QLabel("⏳ 准备启动新进程…")
+        lay.addWidget(lbl_status)
+
+        pb = QProgressBar()
+        pb.setRange(0, 0)
+        lay.addWidget(pb)
+
+        # 进程实例（在 _spawn 中赋值，供后续阶段读取）
+        dlg._proc: subprocess.Popen | None = None  # type: ignore[attr-defined]
+        dlg._spawn_error: str = ""  # type: ignore[attr-defined]
+        dlg._poll_count: int = 0  # type: ignore[attr-defined]
+        dlg._poll_max: int = 50  # type: ignore[attr-defined]   # 5s
+
+        # ---- 3. 阶段 1: 启动新进程 ----
+        def _spawn():
+            lbl_status.setText("⏳ 正在启动新进程…")
+            try:
+                kwargs: dict = {}
+                if sys.platform == "win32":
+                    # Windows 独立进程组，避免父进程退出牵连子进程
+                    kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+                    kwargs["close_fds"] = True
+                dlg._proc = subprocess.Popen(cmd_list, **kwargs)
+            except Exception as exc:
+                dlg._spawn_error = f"{type(exc).__name__}: {exc}"
+                return
+            # 进入阶段 2: 轮询检测进程状态
+            QTimer.singleShot(200, _poll_alive)
+
+        # ---- 4. 阶段 2: 轮询检测新进程是否存活 ----
+        def _poll_alive():
+            dlg._poll_count += 1
+            proc = dlg._proc
+            if proc is None:
+                _show_failure(dlg._spawn_error or "进程启动失败")
+                return
+
+            # poll() 返回 None 表示进程还在跑
+            ret = proc.poll()
+            if ret is None:
+                # 进程存活 → 判定为重启成功
+                _show_success()
+                return
+
+            # 进程已经退出
+            if ret == 0:
+                # 极短时间干净退出可能是 launcher 模式，仍然视为成功
+                _show_success()
+            else:
+                _show_failure(f"新进程已退出，退出码: {ret}")
+                return
+
+            # 未拿到结果且未到超时上限 → 继续轮询
+            if dlg._poll_count < dlg._poll_max:
+                QTimer.singleShot(100, _poll_alive)
+            else:
+                _show_failure(
+                    f"等待 {dlg._poll_max * 100 / 1000:.1f} 秒后仍未检测到新进程稳定运行"
+                )
+
+        # ---- 5. 成功分支: 显示「已启动，N 秒后自动关闭」 ----
+        def _show_success():
+            pb.setRange(0, 1)
+            pb.setValue(1)
+            lbl_status.setText("✅ 新进程已启动，即将自动关闭本窗口…")
+            self._log(f"[ok] 新进程已启动 PID={dlg._proc.pid if dlg._proc else '?'}")
             self._log("[ok] 正在重启 l_repo_sync_gui ...")
-            QApplication.quit()
-        except Exception as exc:
-            self._log(f"[ERR] 重启失败: {exc}")
-            QMessageBox.warning(self, "重启失败", str(exc))
+
+            # 倒计时 1.2s 后自动关闭当前实例
+            remaining = [12]
+
+            def _tick():
+                remaining[0] -= 1
+                secs = remaining[0] / 10
+                lbl_status.setText(f"✅ 新进程已启动，{secs:.1f}s 后关闭…")
+                if remaining[0] <= 0:
+                    dlg.accept()
+                    QApplication.quit()
+                else:
+                    QTimer.singleShot(100, _tick)
+
+            QTimer.singleShot(100, _tick)
+
+        # ---- 6. 失败分支: 保留弹窗，添加「关闭」按钮 ----
+        def _show_failure(error_text: str):
+            pb.setRange(0, 1)
+            pb.setValue(0)
+            pb.setStyleSheet(
+                "QProgressBar::chunk { background-color: #c0392b; }"
+            )
+            lbl_status.setText(f"❌ 重启失败: {error_text}")
+            self._log(f"[ERR] 重启失败: {error_text}")
+
+            err_view = QTextEdit()
+            err_view.setReadOnly(True)
+            err_view.setPlainText(error_text)
+            err_view.setMaximumHeight(90)
+            err_view.setStyleSheet(
+                "QTextEdit { background:#2b1414; color:#ff8080; "
+                "font-family: Consolas, monospace; padding:6px; }"
+            )
+            lay.addWidget(err_view)
+
+            btn_row = QHBoxLayout()
+            btn_row.addStretch()
+            btn_copy = QPushButton("复制命令")
+            btn_copy.clicked.connect(
+                lambda: QApplication.clipboard().setText(cmd_display)
+            )
+            btn_close = QPushButton("关闭")
+            btn_close.setDefault(True)
+            btn_close.clicked.connect(dlg.reject)
+            btn_row.addWidget(btn_copy)
+            btn_row.addWidget(btn_close)
+            lay.addLayout(btn_row)
+
+            # 恢复窗口关闭按钮，允许用户关闭
+            dlg.setWindowFlags(dlg.windowFlags() | Qt.WindowCloseButtonHint)
+            dlg.show()
+
+        # ---- 7. 显示弹窗并开始启动 ----
+        QTimer.singleShot(300, _spawn)
+        dlg.exec()
+
 
     def ask_ai(self):
-        api_key = self.api_key_edit.text().strip()
-        model = self.model_edit.currentText().strip() or DEFAULT_SILICONFLOW_MODEL
-        user_prompt = self.ai_prompt_edit.toPlainText().strip()
-        if not api_key:
-            QMessageBox.warning(self, "问AI失败", "请先填写 SiliconFlow API Key。")
+        cfg = self._ai_config or {}
+        if not cfg.get("enabled", True):
+            QMessageBox.warning(self, "问AI失败", "AI 模型已禁用，请在「模型设置…」中启用。")
             return
+        chat_url, api_key, model = self._get_ai_endpoint()
+        if not api_key:
+            QMessageBox.warning(self, "问AI失败", "请先在「模型设置…」中填写 API Key。")
+            return
+        if not chat_url:
+            QMessageBox.warning(self, "问AI失败", "请先在「模型设置…」中配置 Base URL。")
+            return
+        user_prompt = self.ai_prompt_edit.toPlainText().strip()
         if not user_prompt:
             QMessageBox.warning(self, "问AI失败", "请先输入提问内容。")
             return
@@ -2311,7 +4457,7 @@ class RepoSyncWindow(QMainWindow):
                 ],
             }
             req = urllib.request.Request(
-                SILICONFLOW_URL,
+                chat_url,
                 data=json.dumps(payload).encode("utf-8"),
                 headers={
                     "Content-Type": "application/json",
@@ -2323,12 +4469,13 @@ class RepoSyncWindow(QMainWindow):
                 with _siliconflow_urlopen(req, 60) as resp:
                     text = resp.read().decode("utf-8", errors="replace")
                 data = json.loads(text)
-                content = (
-                    data.get("choices", [{}])[0]
-                    .get("message", {})
-                    .get("content", "")
-                    .strip()
-                )
+                choices = data.get("choices") or []
+                content = ""
+                if choices:
+                    content = (
+                        choices[0].get("message", {}).get("content", "")
+                        or choices[0].get("delta", {}).get("content", "")
+                    ).strip()
                 if not content:
                     content = f"[接口返回为空]\n{text}"
                 self.ai_bridge.finished.emit(True, content)
@@ -2341,10 +4488,16 @@ class RepoSyncWindow(QMainWindow):
         threading.Thread(target=_worker, daemon=True).start()
 
     def _test_model_connection(self):
-        api_key = self.api_key_edit.text().strip()
-        model = self.model_edit.currentText().strip() or DEFAULT_SILICONFLOW_MODEL
+        cfg = self._ai_config or {}
+        if not cfg.get("enabled", True):
+            QMessageBox.warning(self, "模型测试失败", "AI 模型已禁用，请在「模型设置…」中启用。")
+            return
+        chat_url, api_key, model = self._get_ai_endpoint()
         if not api_key:
-            QMessageBox.warning(self, "模型测试失败", "请先填写 SiliconFlow API Key。")
+            QMessageBox.warning(self, "模型测试失败", "请先在「模型设置…」中填写 API Key。")
+            return
+        if not chat_url:
+            QMessageBox.warning(self, "模型测试失败", "请先在「模型设置…」中配置 Base URL。")
             return
 
         payload = {
@@ -2353,7 +4506,7 @@ class RepoSyncWindow(QMainWindow):
             "max_tokens": 16,
         }
         req = urllib.request.Request(
-            SILICONFLOW_URL,
+            chat_url,
             data=json.dumps(payload).encode("utf-8"),
             headers={
                 "Content-Type": "application/json",
@@ -2362,27 +4515,28 @@ class RepoSyncWindow(QMainWindow):
             method="POST",
         )
         try:
-            with _siliconflow_urlopen(req, 5) as resp:
+            with _siliconflow_urlopen(req, 10) as resp:
                 text = resp.read().decode("utf-8", errors="replace")
             data = json.loads(text)
-            content = (
-                data.get("choices", [{}])[0]
-                .get("message", {})
-                .get("content", "")
-                .strip()
-            )
-            self._log(f"[ok] 模型连接测试成功: {model}")
+            choices = data.get("choices") or []
+            content = ""
+            if choices:
+                content = (
+                    choices[0].get("message", {}).get("content", "")
+                    or choices[0].get("delta", {}).get("content", "")
+                ).strip()
+            self._log(f"[ok] 模型连接测试成功: {model} @ {cfg.get('provider')}")
             QMessageBox.information(
                 self,
                 "模型连接测试",
-                f"模型可用: {model}\n返回: {content or '(empty)'}",
+                f"提供商: {cfg.get('provider')}\n模型: {model}\n返回: {content or '(empty)'}",
             )
         except Exception as exc:
             self._log(f"[ERR] 模型连接测试失败: {model} -> {exc}")
             QMessageBox.warning(
                 self,
                 "模型连接测试失败",
-                f"模型: {model}\n错误: {exc}",
+                f"提供商: {cfg.get('provider')}\n模型: {model}\n错误: {exc}",
             )
 
     def _on_ai_result(self, ok: bool, message: str):
@@ -2396,11 +4550,14 @@ class RepoSyncWindow(QMainWindow):
             self._log(f"[ERR] 问AI失败: {message}")
 
     def _request_ai_commit_message(self, pkg_name: str, pkg_dir: Path) -> str | None:
-        api_key = self.api_key_edit.text().strip()
-        if not api_key:
-            self._log(f"[WARN] {pkg_name} 未填写 AI Key，将改为手动输入提交注释")
+        cfg = self._ai_config or {}
+        if not cfg.get("enabled", True):
+            self._log(f"[WARN] {pkg_name} AI 模型已禁用，将改为手动输入提交注释")
             return None
-        model = self.model_edit.currentText().strip() or DEFAULT_SILICONFLOW_MODEL
+        _, api_key, _ = self._get_ai_endpoint()
+        if not api_key:
+            self._log(f"[WARN] {pkg_name} 未填写 AI API Key，将改为手动输入提交注释")
+            return None
 
         ok_name_status, name_status = self._run(
             ["git", "diff", "--cached", "--name-status"], cwd=pkg_dir
@@ -2431,38 +4588,16 @@ class RepoSyncWindow(QMainWindow):
             f"{stat}"
         )
 
-        payload = {
-            "model": model,
-            "messages": [
-                {"role": "system", "content": "你是一个有用的助手，擅长写清晰的 git 提交信息。"},
-                {"role": "user", "content": prompt},
-            ],
-        }
-        req = urllib.request.Request(
-            SILICONFLOW_URL,
-            data=json.dumps(payload).encode("utf-8"),
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {api_key}",
-            },
-            method="POST",
+        ok, content = self._call_ai_text(
+            system="你是一个有用的助手，擅长写清晰的 git 提交信息。",
+            user=prompt,
+            timeout=45,
         )
-        try:
-            with _siliconflow_urlopen(req, 45) as resp:
-                text = resp.read().decode("utf-8", errors="replace")
-            data = json.loads(text)
-            content = (
-                data.get("choices", [{}])[0]
-                .get("message", {})
-                .get("content", "")
-                .strip()
-            )
-            if not content:
-                return None
-            return content
-        except Exception as exc:
-            self._log(f"[WARN] AI 生成提交注释失败，将改为手动输入: {exc}")
-            return None
+        if not ok or not content:
+            if not ok:
+                self._log(f"[WARN] AI 生成提交注释失败，将改为手动输入: {content}")
+            return content if ok else None
+        return content
 
 
 def main():
@@ -2472,6 +4607,41 @@ def main():
     mode_map = {"server": "Server", "client": "Client"}
 
     _set_windows_app_id()
+
+    def _stall_on_trigger(info):
+        """卡顿回调：同时写 stderr 和日志文件（不依赖 GUI）。"""
+        msg = (
+            f"[stall] {info.thread_name} 卡顿了({info.duration:.1f}s) "
+            f"位置: {info.stack_signature[:120]}"
+        )
+        # 1. stderr（即使无控制台窗口也会写到父进程/终端）
+        print(msg, file=sys.stderr, flush=True)
+        # 2. 日志文件（如果已初始化）
+        if _stall_log_fh is not None:
+            try:
+                _stall_log_fh.write(msg + "\n")
+                _stall_log_fh.flush()
+            except Exception:
+                pass
+
+    # 先创建日志文件，供 stall 回调写入
+    _stall_log_fh = None
+    try:
+        _log_dir = Path(os.environ.get("TEMP", ".")) / "l_repo_sync_gui" / "logs"
+        _log_dir.mkdir(parents=True, exist_ok=True)
+        _today = datetime.datetime.now().strftime("%Y-%m-%d")
+        _stall_log_fh = open(_log_dir / f"sync_{_today}.log", "a", encoding="utf-8")
+    except Exception:
+        pass
+
+    lprint.stall_monitor_start(
+        threshold_s=5,
+        poll_interval=1,
+        monitor_all_threads=True,
+        on_trigger=_stall_on_trigger,
+    )
+    print("[stall_monitor] 已启动 (threshold=5s, poll=1s)", file=sys.stderr, flush=True)
+
     app = QApplication(sys.argv)
     if APP_ICON_FILE.exists():
         app.setWindowIcon(QIcon(str(APP_ICON_FILE)))

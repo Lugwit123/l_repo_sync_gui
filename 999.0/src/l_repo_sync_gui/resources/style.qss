@@ -1,0 +1,190 @@
+/* ═══════════════════════════════════════════════════════════════
+   l_repo_sync_gui — 全局样式表
+   ═══════════════════════════════════════════════════════════════ */
+
+/* ── 主窗口 ── */
+QMainWindow {
+    background: #1f1f22;
+}
+
+/* ── 标签 ── */
+QLabel {
+    font-size: 13px;
+    color: #e0e0e0;
+}
+
+/* ── 输入框 ── */
+QLineEdit, QTextEdit {
+    font-size: 13px;
+    color: #e0e0e0;
+    background: #2a2a2d;
+    border: 1px solid #3b3b3f;
+    border-radius: 4px;
+    padding: 6px;
+    selection-background-color: #264f78;
+}
+QLineEdit:focus, QTextEdit:focus {
+    border-color: #5a9fd4;
+}
+
+/* ── 下拉框 ── */
+QComboBox {
+    font-size: 13px;
+    color: #e0e0e0;
+    background: #2a2a2d;
+    border: 1px solid #3b3b3f;
+    border-radius: 4px;
+    padding: 4px 6px;
+}
+QComboBox:hover {
+    border-color: #5a9fd4;
+}
+QComboBox::drop-down {
+    border: none;
+    width: 20px;
+}
+
+/* ── 滚动区域 ── */
+QScrollArea {
+    border: 1px solid #3b3b3f;
+    border-radius: 4px;
+    background: #1f1f22;
+}
+
+/* ── 分割线 ── */
+QSplitter::handle {
+    background: #3b3b3f;
+}
+QSplitter::handle:horizontal {
+    width: 3px;
+}
+QSplitter::handle:vertical {
+    height: 3px;
+}
+
+/* ══════════════════════════════════════════════════════════════
+   按钮 — 通用样式
+   ══════════════════════════════════════════════════════════════ */
+QPushButton {
+    min-height: 28px;
+    padding: 1px 8px;
+    font-size: 13px;
+    color: #e0e0e0;
+    background: #2d2d30;
+    border: 1px solid #3f3f46;
+    border-radius: 4px;
+}
+QPushButton:hover {
+    background: #3e3e42;
+    border-color: #5a9fd4;
+    color: #ffffff;
+}
+QPushButton:pressed {
+    background: #1c97ea;
+    border-color: #1c97ea;
+    color: #ffffff;
+}
+QPushButton:disabled {
+    color: #6a6a6a;
+    background: #252526;
+    border-color: #333336;
+}
+
+/* ══════════════════════════════════════════════════════════════
+   按钮 — 行按钮（包列表每行的操作按钮）
+   ══════════════════════════════════════════════════════════════ */
+QPushButton[class="row-btn"] {
+    min-height: 20px;
+    max-height: 20px;
+    padding: 0px 4px;
+    font-size: 11px;
+    color: #d4d4d4;
+    background: #2d2d30;
+    border: 1px solid #3f3f46;
+    border-radius: 3px;
+}
+QPushButton[class="row-btn"]:hover {
+    background: #3e3e42;
+    border-color: #5a9fd4;
+    color: #ffffff;
+}
+QPushButton[class="row-btn"]:pressed {
+    background: #1c97ea;
+    border-color: #1c97ea;
+    color: #ffffff;
+}
+QPushButton[class="row-btn"]:disabled {
+    color: #6a6a6a;
+    background: #252526;
+    border-color: #333336;
+}
+
+/* ══════════════════════════════════════════════════════════════
+   按钮 — AI 合并按钮（紫色主题）
+   ══════════════════════════════════════════════════════════════ */
+QPushButton[class="merge-btn"] {
+    min-height: 20px;
+    max-height: 20px;
+    padding: 1px 6px;
+    font-size: 11px;
+    color: #9333ea;
+    background: #2d2d30;
+    border: 1px solid #5b21b6;
+    border-radius: 3px;
+}
+QPushButton[class="merge-btn"]:hover {
+    background: #3b2066;
+    border-color: #a855f7;
+    color: #c084fc;
+}
+QPushButton[class="merge-btn"]:pressed {
+    background: #7c3aed;
+    border-color: #7c3aed;
+    color: #ffffff;
+}
+QPushButton[class="merge-btn"]:disabled {
+    color: #6a6a6a;
+    background: #252526;
+    border-color: #333336;
+}
+
+/* ══════════════════════════════════════════════════════════════
+   按钮 — 刷新按钮（蓝色主题）
+   ══════════════════════════════════════════════════════════════ */
+QPushButton[class="refresh-btn"] {
+    min-height: 20px;
+    max-height: 20px;
+    padding: 0px 4px;
+    font-size: 11px;
+    color: #4fc3f7;
+    background: #2d2d30;
+    border: 1px solid #0277bd;
+    border-radius: 3px;
+}
+QPushButton[class="refresh-btn"]:hover {
+    background: #1a3a4a;
+    border-color: #4fc3f7;
+    color: #81d4fa;
+}
+QPushButton[class="refresh-btn"]:pressed {
+    background: #0288d1;
+    border-color: #0288d1;
+    color: #ffffff;
+}
+QPushButton[class="refresh-btn"]:disabled {
+    color: #6a6a6a;
+    background: #252526;
+    border-color: #333336;
+}
+
+/* ── QFrame 顶部栏 ── */
+QFrame#top_bar {
+    background: #27272a;
+    border: 1px solid #3b3b3f;
+    border-radius: 6px;
+}
+
+/* ── 分隔线 ── */
+QFrame[frameShape="4"] {
+    color: #5a5a62;
+}
