@@ -4302,21 +4302,18 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
             self.download_one(pkg_dir)
 
     def restart_self(self):
-        """重启程序，通过 wuwor 启动以确保 rez 环境正确。"""
+        """重启程序：先启动新实例，再强制退出当前实例，避免卡在清理阶段。"""
         import shlex
 
-        # ---- 1. 构建重启命令（使用 wuwor 启动） ----
-        # wuwor.bat 已在环境变量 PATH 中，直接使用
-        cmd_list = ["cmd.exe", "/c", "wuwor.bat", "l_repo_sync_gui", "--", "l_repo_sync_gui"]
+        script_path = Path(__file__).resolve()
+        cmd_list = [sys.executable, str(script_path)]
         try:
             cmd_display = shlex.join(cmd_list)
         except Exception:
             cmd_display = " ".join(str(x) for x in cmd_list)
 
-        # 诊断日志
         self._log(f"[restart] cmd_list: {cmd_list}")
 
-        # ---- 2. 构建重启进度弹窗 ----
         dlg = QDialog(self)
         dlg.setWindowTitle("正在重启 l_repo_sync_gui")
         dlg.setMinimumWidth(560)
@@ -4354,72 +4351,13 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
         pb.setRange(0, 0)
         lay.addWidget(pb)
 
-        # 进程实例（在 _spawn 中赋值，供后续阶段读取）
-        dlg._proc: subprocess.Popen | None = None  # type: ignore[attr-defined]
-        dlg._spawn_error: str = ""  # type: ignore[attr-defined]
-        dlg._poll_count: int = 0  # type: ignore[attr-defined]
-        dlg._poll_max: int = 50  # type: ignore[attr-defined]   # 5s
+        dlg._proc = None  # type: ignore[attr-defined]
+        dlg._spawn_error = ""  # type: ignore[attr-defined]
 
-        # ---- 3. 阶段 1: 启动新进程（通过 wuwor） ----
-        def _spawn():
-            lbl_status.setText("⏳ 正在启动新进程（通过 wuwor）…")
-            try:
-                # wuwor.bat 会启动新的 rez 环境进程，cmd.exe /c 会在 wuwor 完成后退出
-                kwargs: dict = {"shell": True}
-                if sys.platform == "win32":
-                    kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-                    kwargs["close_fds"] = True
-                dlg._proc = subprocess.Popen(" ".join(cmd_list), **kwargs)
-            except Exception as exc:
-                dlg._spawn_error = f"{type(exc).__name__}: {exc}"
-                return
-            # 进入阶段 2: 等待 cmd.exe 完成并视为成功
-            QTimer.singleShot(500, _poll_alive)
-
-        # ---- 4. 阶段 2: 等待 wuwor 启动完成 ----
-        def _poll_alive():
-            dlg._poll_count += 1
-            proc = dlg._proc
-            if proc is None:
-                _show_failure(dlg._spawn_error or "进程启动失败")
-                return
-
-            # poll() 返回 None 表示 cmd.exe 还在运行（wuwor 还没完成）
-            ret = proc.poll()
-            self._log(f"[restart] poll #{dlg._poll_count}: ret={ret}")
-            
-            if ret is None:
-                # cmd.exe 还在运行，继续等待
-                if dlg._poll_count < dlg._poll_max:
-                    QTimer.singleShot(200, _poll_alive)
-                else:
-                    # 超时但 cmd 还在跑，也视为成功（可能 wuwor 在等待）
-                    _show_success()
-                return
-
-            # cmd.exe 已退出（wuwor 完成启动）
-            if ret == 0:
-                _show_success()
-            else:
-                _show_failure(f"wuwor 退出码: {ret}")
-
-        # ---- 5. 成功分支: 立即退出，让新实例正常启动 ----
-        def _show_success():
-            pb.setRange(0, 1)
-            pb.setValue(1)
-            lbl_status.setText("✅ 新进程已通过 wuwor 启动，正在关闭本窗口…")
-            self._log("[ok] wuwor 已启动 l_repo_sync_gui")
-            self._log("[ok] 正在重启 l_repo_sync_gui ...")
-            # 立即关闭当前实例，避免新实例被单实例检测拦截
-            QTimer.singleShot(100, lambda: (dlg.accept(), QApplication.quit()))
-
-        # ---- 6. 失败分支: 保留弹窗，添加「关闭」按钮 ----
         def _show_failure(error_text: str):
             pb.setRange(0, 1)
             pb.setValue(0)
-            pb.setStyleSheet(
-                "QProgressBar::chunk { background-color: #c0392b; }"
-            )
+            pb.setStyleSheet("QProgressBar::chunk { background-color: #c0392b; }")
             lbl_status.setText(f"❌ 重启失败: {error_text}")
             self._log(f"[ERR] 重启失败: {error_text}")
 
@@ -4436,22 +4374,57 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
             btn_row = QHBoxLayout()
             btn_row.addStretch()
             btn_copy = QPushButton("复制命令")
-            btn_copy.clicked.connect(
-                lambda: QApplication.clipboard().setText(cmd_display)
-            )
+            btn_copy.clicked.connect(lambda: QApplication.clipboard().setText(cmd_display))
             btn_close = QPushButton("关闭")
             btn_close.setDefault(True)
             btn_close.clicked.connect(dlg.reject)
             btn_row.addWidget(btn_copy)
             btn_row.addWidget(btn_close)
             lay.addLayout(btn_row)
-
-            # 恢复窗口关闭按钮，允许用户关闭
             dlg.setWindowFlags(dlg.windowFlags() | Qt.WindowCloseButtonHint)
             dlg.show()
 
-        # ---- 7. 显示弹窗并开始启动 ----
-        QTimer.singleShot(300, _spawn)
+        def _force_exit_current_app():
+            try:
+                app = QApplication.instance()
+                if app is not None:
+                    app.quit()
+            finally:
+                os._exit(0)
+
+        def _show_success():
+            pb.setRange(0, 1)
+            pb.setValue(1)
+            lbl_status.setText("✅ 新进程已启动，正在退出当前实例…")
+            self._log("[ok] 已启动 l_repo_sync_gui 新实例")
+            QTimer.singleShot(200, _force_exit_current_app)
+
+        def _spawn():
+            lbl_status.setText("⏳ 正在启动新进程…")
+            try:
+                creationflags = 0
+                if sys.platform == "win32":
+                    creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+                    creationflags |= getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+                    creationflags |= getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+                dlg._proc = subprocess.Popen(
+                    cmd_list,
+                    cwd=str(script_path.parent),
+                    env=os.environ.copy(),
+                    creationflags=creationflags,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    close_fds=True,
+                )
+            except Exception as exc:
+                dlg._spawn_error = f"{type(exc).__name__}: {exc}"
+                _show_failure(dlg._spawn_error)
+                return
+
+            _show_success()
+
+        QTimer.singleShot(200, _spawn)
         dlg.exec()
 
 
