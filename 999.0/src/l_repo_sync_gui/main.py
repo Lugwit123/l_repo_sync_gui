@@ -23,6 +23,7 @@ except ImportError:
 from pathlib import Path
 
 from PySide6.QtCore import QFile, QObject, Qt, QTimer, Signal
+from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtGui import QColor, QIcon, QSyntaxHighlighter, QTextCharFormat
 from PySide6.QtUiTools import QUiLoader
 from PySide6.QtWidgets import (
@@ -50,8 +51,8 @@ from PySide6.QtWidgets import (
     QTextEdit,
 )
 from l_qt_wgt_lib.smart_widget import CodeEditorWidget, LogCodeHighlighter
+from l_qt_wgt_lib.tray_window import TrayAwareMixin
 from pytracemp import lprint, LPrint
-
 
 IGNORE_LINES = [
     "__pycache__/",
@@ -249,7 +250,7 @@ class _DiffHighlighter(QSyntaxHighlighter):
             self.setFormat(0, len(text), self._fmt_del)
 
 
-class RepoSyncWindow(QMainWindow):
+class RepoSyncWindow(TrayAwareMixin, QMainWindow):
     def __init__(self, launch_mode: str | None = None):
         super().__init__()
         self.rez_source = _find_rez_source_root()
@@ -301,7 +302,10 @@ class RepoSyncWindow(QMainWindow):
             except Exception:
                 pass
         super().closeEvent(event)
-    
+
+    def on_tray_message_log(self, message: str) -> None:
+        self._log(message)
+
     def _load_ui(self):
         ui_path = RESOURCES_DIR / "main_window.ui"
         loader = QUiLoader()
@@ -2810,13 +2814,18 @@ class RepoSyncWindow(QMainWindow):
                 self._package_refresh_bridge.log.emit(f"{icon} 扫描 {pkg_name} ({elapsed_str})")
         return status_map
 
-    def _style_package_status_label(self, label: QLabel, sync: dict[str, int]):
+    def _style_package_status_label(
+        self, label: QLabel, sync: dict[str, int], counts: dict[str, int] | None = None
+    ):
         if self._is_diverged(sync):
             label.setStyleSheet("font-size: 12px; color: #9333ea; font-weight: bold;")
         elif sync.get("behind", 0):
             label.setStyleSheet("font-size: 12px; color: #d97706;")
         elif sync.get("ahead", 0):
             label.setStyleSheet("font-size: 12px; color: #2563eb;")
+        elif counts and any(counts.get(k, 0) for k in ("modified", "untracked", "deleted", "staged", "renamed", "conflicted")):
+            # 仅本地有修改，无 ahead/behind
+            label.setStyleSheet("font-size: 12px; color: #16a34a; font-weight: bold;")
         else:
             label.setStyleSheet("font-size: 12px;")
 
@@ -2829,7 +2838,7 @@ class RepoSyncWindow(QMainWindow):
                 continue
             counts, sync, err = status_map.get(pkg_name, ({}, {"ahead": 0, "behind": 0}, ""))
             label.setText(f"{pkg_name}{self._format_package_status_suffix(counts, err, sync)}")
-            self._style_package_status_label(label, sync)
+            self._style_package_status_label(label, sync, counts)
             if not err:
                 self.package_sync_map[pkg_name] = sync
         self._update_merge_buttons()
@@ -2867,7 +2876,8 @@ class RepoSyncWindow(QMainWindow):
             label.setText(
                 f"{pkg_name}{self._format_package_status_suffix(counts if ok else {}, err, sync if ok else {})}"
             )
-            self._style_package_status_label(label, sync if ok else {})
+            self._style_package_status_label(
+                label, sync if ok else {}, counts if ok else None)
             if ok:
                 self.package_sync_map[pkg_name] = sync
         merge_btn = self.package_merge_buttons.get(pkg_name)
@@ -3040,7 +3050,7 @@ class RepoSyncWindow(QMainWindow):
                 counts, sync, err = status_map.get(pkg_name, ({}, {"ahead": 0, "behind": 0}, ""))
                 status_text = self._format_package_status_suffix(counts, err, sync)
                 label = QLabel(f"{pkg_name}{status_text}")
-                self._style_package_status_label(label, sync)
+                self._style_package_status_label(label, sync, counts)
                 if not err:
                     self.package_sync_map[pkg_name] = sync
             label.setMinimumWidth(200)
@@ -3325,6 +3335,7 @@ class RepoSyncWindow(QMainWindow):
         )
         if ok_push:
             self._log(f"[ok] {pkg_name} created and pushed")
+            self._log_upload_summary(pkg_dir, pkg_name)
             return True
 
         self._log(f"[ERR] {pkg_name} 建仓后 push 失败: {msg_push}")
@@ -3533,7 +3544,7 @@ class RepoSyncWindow(QMainWindow):
         self._apply_diff_highlight(overview)
         tabs.addTab(overview, "总览")
 
-        file_blocks = self._extract_file_diff_blocks(clipped)
+        file_blocks = self._extract_file_diff_blocks(preview)
         for file_name, block in file_blocks:
             editor = QTextEdit(dlg)
             editor.setReadOnly(True)
@@ -3716,7 +3727,8 @@ class RepoSyncWindow(QMainWindow):
                 current_lines = [line]
                 parts = line.split()
                 if len(parts) >= 4 and parts[2].startswith("a/"):
-                    current_name = parts[2][2:]
+                    rel_path = parts[2][2:]
+                    current_name = Path(rel_path).name
                 else:
                     current_name = f"file_{len(blocks) + 1}"
                 continue
@@ -3874,6 +3886,29 @@ class RepoSyncWindow(QMainWindow):
         self._append_local_pending_preview(out, pkg_dir, ok_status, status_lines)
         return out
 
+    def _log_upload_summary(self, pkg_dir: Path, pkg_name: str) -> None:
+        """上传成功后显示提交注释和文件列表。"""
+        # 获取最新 commit message
+        ok_msg, commit_msg = self._run(
+            ["git", "log", "-1", "--format=%B"], cwd=pkg_dir
+        )
+        if ok_msg and commit_msg:
+            self._log(f"[提交注释] {pkg_name}:")
+            for line in commit_msg.strip().splitlines():
+                self._log(f"  {line}")
+
+        # 获取最新 commit 的文件列表
+        ok_files, files_output = self._run(
+            ["git", "diff-tree", "--no-commit-id", "--name-status", "-r", "HEAD"],
+            cwd=pkg_dir,
+        )
+        if ok_files and files_output and files_output.strip():
+            self._log(f"[上传文件] {pkg_name}:")
+            for line in files_output.strip().splitlines():
+                self._log(f"  {line}")
+        elif ok_files:
+            self._log(f"[上传文件] {pkg_name}: (本次提交无文件变化)")
+
     def _format_status_lines_with_full_path(self, pkg_dir: Path, status_lines: list[str]) -> list[str]:
         """将 git status --porcelain 输出转换为带完整路径的可读行。"""
         out: list[str] = []
@@ -3903,11 +3938,15 @@ class RepoSyncWindow(QMainWindow):
         out: list[str] = []
         ok_unstaged, msg_unstaged = self._run(["git", "diff", "--patch"], cwd=pkg_dir)
         if ok_unstaged and (msg_unstaged or "").strip():
-            out.extend(["[未暂存改动 diff]", msg_unstaged.strip(), ""])
+            out.append("[未暂存改动 diff]")
+            out.extend(msg_unstaged.strip().splitlines())
+            out.append("")
 
         ok_staged, msg_staged = self._run(["git", "diff", "--cached", "--patch"], cwd=pkg_dir)
         if ok_staged and (msg_staged or "").strip():
-            out.extend(["[已暂存改动 diff]", msg_staged.strip(), ""])
+            out.append("[已暂存改动 diff]")
+            out.extend(msg_staged.strip().splitlines())
+            out.append("")
 
         for raw in status_lines:
             parsed = self._parse_porcelain_line(raw)
@@ -4053,6 +4092,7 @@ class RepoSyncWindow(QMainWindow):
             ok_push, msg_push = self._run(push_cmd, cwd=pkg_dir)
             if ok_push:
                 self._log(f"[ok] {pkg_name} pushed")
+                self._log_upload_summary(pkg_dir, pkg_name)
                 return
 
             if self._is_non_fast_forward_error(msg_push):
@@ -4071,6 +4111,7 @@ class RepoSyncWindow(QMainWindow):
                     ok_force, msg_force = self._run(force_cmd, cwd=pkg_dir)
                     if ok_force:
                         self._log(f"[ok] {pkg_name} 强制推送成功")
+                        self._log_upload_summary(pkg_dir, pkg_name)
                         return
                     self._log(f"[ERR] {pkg_name} 强制推送失败: {msg_force}")
                     QMessageBox.warning(
@@ -4261,15 +4302,19 @@ class RepoSyncWindow(QMainWindow):
             self.download_one(pkg_dir)
 
     def restart_self(self):
-        """重启程序，过程中显示进度弹窗，成功后自动关闭，失败保留弹窗显示错误。"""
+        """重启程序，通过 wuwor 启动以确保 rez 环境正确。"""
         import shlex
 
-        # ---- 1. 构建重启命令 ----
-        cmd_list = [sys.executable, *sys.argv]
+        # ---- 1. 构建重启命令（使用 wuwor 启动） ----
+        # wuwor.bat 已在环境变量 PATH 中，直接使用
+        cmd_list = ["cmd.exe", "/c", "wuwor.bat", "l_repo_sync_gui", "--", "l_repo_sync_gui"]
         try:
             cmd_display = shlex.join(cmd_list)
         except Exception:
             cmd_display = " ".join(str(x) for x in cmd_list)
+
+        # 诊断日志
+        self._log(f"[restart] cmd_list: {cmd_list}")
 
         # ---- 2. 构建重启进度弹窗 ----
         dlg = QDialog(self)
@@ -4315,23 +4360,23 @@ class RepoSyncWindow(QMainWindow):
         dlg._poll_count: int = 0  # type: ignore[attr-defined]
         dlg._poll_max: int = 50  # type: ignore[attr-defined]   # 5s
 
-        # ---- 3. 阶段 1: 启动新进程 ----
+        # ---- 3. 阶段 1: 启动新进程（通过 wuwor） ----
         def _spawn():
-            lbl_status.setText("⏳ 正在启动新进程…")
+            lbl_status.setText("⏳ 正在启动新进程（通过 wuwor）…")
             try:
-                kwargs: dict = {}
+                # wuwor.bat 会启动新的 rez 环境进程，cmd.exe /c 会在 wuwor 完成后退出
+                kwargs: dict = {"shell": True}
                 if sys.platform == "win32":
-                    # Windows 独立进程组，避免父进程退出牵连子进程
                     kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
                     kwargs["close_fds"] = True
-                dlg._proc = subprocess.Popen(cmd_list, **kwargs)
+                dlg._proc = subprocess.Popen(" ".join(cmd_list), **kwargs)
             except Exception as exc:
                 dlg._spawn_error = f"{type(exc).__name__}: {exc}"
                 return
-            # 进入阶段 2: 轮询检测进程状态
-            QTimer.singleShot(200, _poll_alive)
+            # 进入阶段 2: 等待 cmd.exe 完成并视为成功
+            QTimer.singleShot(500, _poll_alive)
 
-        # ---- 4. 阶段 2: 轮询检测新进程是否存活 ----
+        # ---- 4. 阶段 2: 等待 wuwor 启动完成 ----
         def _poll_alive():
             dlg._poll_count += 1
             proc = dlg._proc
@@ -4339,51 +4384,34 @@ class RepoSyncWindow(QMainWindow):
                 _show_failure(dlg._spawn_error or "进程启动失败")
                 return
 
-            # poll() 返回 None 表示进程还在跑
+            # poll() 返回 None 表示 cmd.exe 还在运行（wuwor 还没完成）
             ret = proc.poll()
+            self._log(f"[restart] poll #{dlg._poll_count}: ret={ret}")
+            
             if ret is None:
-                # 进程存活 → 判定为重启成功
-                _show_success()
+                # cmd.exe 还在运行，继续等待
+                if dlg._poll_count < dlg._poll_max:
+                    QTimer.singleShot(200, _poll_alive)
+                else:
+                    # 超时但 cmd 还在跑，也视为成功（可能 wuwor 在等待）
+                    _show_success()
                 return
 
-            # 进程已经退出
+            # cmd.exe 已退出（wuwor 完成启动）
             if ret == 0:
-                # 极短时间干净退出可能是 launcher 模式，仍然视为成功
                 _show_success()
             else:
-                _show_failure(f"新进程已退出，退出码: {ret}")
-                return
+                _show_failure(f"wuwor 退出码: {ret}")
 
-            # 未拿到结果且未到超时上限 → 继续轮询
-            if dlg._poll_count < dlg._poll_max:
-                QTimer.singleShot(100, _poll_alive)
-            else:
-                _show_failure(
-                    f"等待 {dlg._poll_max * 100 / 1000:.1f} 秒后仍未检测到新进程稳定运行"
-                )
-
-        # ---- 5. 成功分支: 显示「已启动，N 秒后自动关闭」 ----
+        # ---- 5. 成功分支: 立即退出，让新实例正常启动 ----
         def _show_success():
             pb.setRange(0, 1)
             pb.setValue(1)
-            lbl_status.setText("✅ 新进程已启动，即将自动关闭本窗口…")
-            self._log(f"[ok] 新进程已启动 PID={dlg._proc.pid if dlg._proc else '?'}")
+            lbl_status.setText("✅ 新进程已通过 wuwor 启动，正在关闭本窗口…")
+            self._log("[ok] wuwor 已启动 l_repo_sync_gui")
             self._log("[ok] 正在重启 l_repo_sync_gui ...")
-
-            # 倒计时 1.2s 后自动关闭当前实例
-            remaining = [12]
-
-            def _tick():
-                remaining[0] -= 1
-                secs = remaining[0] / 10
-                lbl_status.setText(f"✅ 新进程已启动，{secs:.1f}s 后关闭…")
-                if remaining[0] <= 0:
-                    dlg.accept()
-                    QApplication.quit()
-                else:
-                    QTimer.singleShot(100, _tick)
-
-            QTimer.singleShot(100, _tick)
+            # 立即关闭当前实例，避免新实例被单实例检测拦截
+            QTimer.singleShot(100, lambda: (dlg.accept(), QApplication.quit()))
 
         # ---- 6. 失败分支: 保留弹窗，添加「关闭」按钮 ----
         def _show_failure(error_text: str):
@@ -4643,9 +4671,39 @@ def main():
     print("[stall_monitor] 已启动 (threshold=5s, poll=1s)", file=sys.stderr, flush=True)
 
     app = QApplication(sys.argv)
+
+    # ---------- 单实例检测 ----------
+    server_name = "l_repo_sync_gui_single"
+    socket = QLocalSocket()
+    socket.connectToServer(server_name)
+    if socket.waitForConnected(500):
+        # 已有实例运行，通知它激活窗口后退出
+        socket.write(b"activate")
+        socket.waitForBytesWritten(500)
+        socket.disconnectFromServer()
+        print("[single-instance] 已有实例运行，已通知激活", file=sys.stderr, flush=True)
+        sys.exit(0)
+
+    # 当前是第一个实例，启动 server 监听
+    QLocalServer.removeServer(server_name)
+    server = QLocalServer()
+    server.listen(server_name)
+
     if APP_ICON_FILE.exists():
         app.setWindowIcon(QIcon(str(APP_ICON_FILE)))
     win = RepoSyncWindow(mode_map.get(args.mode) or None)
+
+    # 收到第二个实例的连接时，激活本窗口
+    def _on_new_connection():
+        conn = server.nextPendingConnection()
+        if conn:
+            win.showNormal()
+            win.raise_()
+            win.activateWindow()
+            conn.deleteLater()
+
+    server.newConnection.connect(_on_new_connection)
+
     win.show()
     sys.exit(app.exec())
 
