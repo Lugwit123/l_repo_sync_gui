@@ -16,6 +16,8 @@ import urllib.error
 import webbrowser
 import urllib.request
 
+from git import Repo
+
 try:
     import winreg  # 用于读取 Windows IE 代理
 except ImportError:
@@ -225,6 +227,10 @@ class _AiStreamBridge(QObject):
     finished = Signal(bool, str)
 
 
+class _AiMergePreviewBridge(QObject):
+    finished = Signal(str, bool, str)
+
+
 class _DiffHighlighter(QSyntaxHighlighter):
     """简单 diff 语法高亮。"""
 
@@ -264,6 +270,7 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
             self.setWindowIcon(QIcon(str(APP_ICON_FILE)))
 
         self.row_buttons = []
+        self.package_row_buttons: dict[str, dict[str, QPushButton]] = {}
         self.package_entries: list[tuple[str, Path, bool]] = []
         self.package_status_labels: dict[str, QLabel] = {}
         self.package_sync_map: dict[str, dict[str, int]] = {}
@@ -1461,17 +1468,13 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
             QMessageBox.warning(self, "启动失败", str(exc))
 
     def _resolve_git_executable(self, from_manual: bool = True) -> str | None:
-        """返回可执行 git 路径（优先用户输入）。"""
+        """保留给旧逻辑兼容使用；GitPython 优先，不再依赖 git.exe。"""
         manual = (self.git_path_edit.text() or "").strip() if from_manual else ""
-        if manual:
-            if os.path.isfile(manual):
-                return manual
-            return None
-
+        if manual and os.path.isfile(manual):
+            return manual
         which_git = shutil.which("git")
         if which_git and os.path.isfile(which_git):
             return which_git
-
         default_paths = [
             r"C:\Program Files\Git\cmd\git.exe",
             r"C:\Program Files\Git\bin\git.exe",
@@ -1482,6 +1485,14 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
             if os.path.isfile(p):
                 return p
         return None
+
+    def _repo(self, pkg_dir: Path) -> Repo | None:
+        try:
+            if not (pkg_dir / ".git").is_dir():
+                return None
+            return Repo(str(pkg_dir))
+        except Exception:
+            return None
 
     def _resolve_gh_executable(self, from_manual: bool = True) -> str | None:
         """返回可执行 gh 路径（优先用户输入）。"""
@@ -1845,9 +1856,11 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
         return True, names, ""
 
     def _collect_full_package_data(
-        self, owner: str
+        self,
+        owner: str,
+        on_entry_ready=None,
     ) -> tuple[list[tuple[str, Path, bool]], dict, list[str]]:
-        """后台收集包列表与 git 状态（不触碰 UI）。"""
+        """后台收集包列表与 git 状态。"""
         warnings: list[str] = []
         local = self._local_package_entries()
         local_names = {name for name, _ in local}
@@ -1855,10 +1868,10 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
             (name, path, False) for name, path in local
         ]
 
-        self._package_refresh_bridge.log.emit("[阶段1] 获取远端仓库列表…")
+        self._package_refresh_bridge.log.emit("获取远端仓库列表…")
         ok, remote_names, err = self._fetch_remote_repo_names_quiet(owner)
         if ok:
-            self._package_refresh_bridge.log.emit(f"[阶段1] 远端仓库数: {len(remote_names)}")
+            self._package_refresh_bridge.log.emit(f"远端仓库数: {len(remote_names)}")
             for name in sorted(set(remote_names), key=str.lower):
                 if name in local_names or name in SKIP_DIRS:
                     continue
@@ -1866,14 +1879,7 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
         elif self._resolve_gh_executable(from_manual=False):
             warnings.append(f"[WARN] 获取远端仓库列表失败，仅显示本地包: {err}")
 
-        scannable = [(name, path) for name, path, remote_only in entries if not remote_only]
-        self._package_refresh_bridge.log.emit(f"[阶段2] 准备扫描 {len(scannable)} 个本地包")
-        if scannable:
-            self._prefetch_remotes_for_packages(scannable)
-        status_map = self._scan_all_package_status(
-            scannable, check_remote=True, fetch_remote=False
-        )
-        return entries, status_map, warnings
+        return entries, {}, warnings
 
     def _package_entries(self) -> list[tuple[str, Path, bool]]:
         """本地包 + 远端有但本地无的仓库。"""
@@ -1926,10 +1932,13 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
             return None
 
     def _git_name_only_set(self, pkg_dir: Path, rev_range: str) -> set[str]:
-        ok, msg = self._run(["git", "diff", "--name-only", rev_range], cwd=pkg_dir)
-        if not ok:
+        repo = self._repo(pkg_dir)
+        if repo is None:
             return set()
-        return {line.strip().replace("\\", "/") for line in (msg or "").splitlines() if line.strip()}
+        try:
+            return {str(path).replace("\\", "/") for path in repo.git.diff("--name-only", rev_range).splitlines() if str(path).strip()}
+        except Exception:
+            return set()
 
     def _uncommitted_path_set(self, pkg_dir: Path) -> set[str]:
         ok, status_lines = self._status_lines(pkg_dir)
@@ -1949,38 +1958,44 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
         return paths
 
     def _upstream_ref(self, pkg_dir: Path) -> str | None:
-        ok, upstream_raw = self._run(
-            ["git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"], cwd=pkg_dir
-        )
-        if not ok or not (upstream_raw or "").strip():
+        repo = self._repo(pkg_dir)
+        if repo is None:
             return None
-        return upstream_raw.strip().splitlines()[-1]
+        try:
+            tracking = repo.active_branch.tracking_branch()
+            return str(tracking) if tracking is not None else None
+        except Exception:
+            return None
 
     def _analyze_merge_plan(self, pkg_dir: Path) -> tuple[dict | None, str]:
         """按 merge-base 划分：本地独有 / 远端独有 / 双方均改。"""
-        self._run(["git", "fetch", "--all", "--prune"], cwd=pkg_dir)
-        upstream = self._upstream_ref(pkg_dir)
-        if not upstream:
-            return None, "无上游分支"
-        ok_base, base_raw = self._run(["git", "merge-base", "HEAD", upstream], cwd=pkg_dir)
-        if not ok_base or not (base_raw or "").strip():
-            return None, "无法计算 merge-base（可能无共同历史）"
-        merge_base = base_raw.strip().splitlines()[-1]
-
-        local_files = self._git_name_only_set(pkg_dir, f"{merge_base}..HEAD")
-        local_files |= self._uncommitted_path_set(pkg_dir)
-        remote_files = self._git_name_only_set(pkg_dir, f"{merge_base}..{upstream}")
-
-        local_only = sorted(local_files - remote_files)
-        remote_only = sorted(remote_files - local_files)
-        both = sorted(local_files & remote_files)
-        return {
-            "upstream": upstream,
-            "merge_base": merge_base,
-            "local_only": local_only,
-            "remote_only": remote_only,
-            "both": both,
-        }, ""
+        repo = self._repo(pkg_dir)
+        if repo is None:
+            return None, "非git仓库"
+        try:
+            try:
+                repo.remotes.origin.fetch(prune=True)
+            except Exception:
+                pass
+            upstream = self._upstream_ref(pkg_dir)
+            if not upstream:
+                return None, "无上游分支"
+            merge_base = repo.git.merge_base("HEAD", upstream).strip().splitlines()[-1]
+            local_files = self._git_name_only_set(pkg_dir, f"{merge_base}..HEAD")
+            local_files |= self._uncommitted_path_set(pkg_dir)
+            remote_files = self._git_name_only_set(pkg_dir, f"{merge_base}..{upstream}")
+            local_only = sorted(local_files - remote_files)
+            remote_only = sorted(remote_files - local_files)
+            both = sorted(local_files & remote_files)
+            return {
+                "upstream": upstream,
+                "merge_base": merge_base,
+                "local_only": local_only,
+                "remote_only": remote_only,
+                "both": both,
+            }, ""
+        except Exception as exc:
+            return None, str(exc)
 
     def _preview_ai_merge(self, pkg_dir: Path) -> tuple[list[str], dict | None, str]:
         plan, err = self._analyze_merge_plan(pkg_dir)
@@ -2002,15 +2017,34 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
         lines.extend(plan["both"][:40] or ["(无)"])
         if len(plan["both"]) > 40:
             lines.append(f"...(共 {len(plan['both'])} 个)")
+
+        # 追加详细 diff 预览，供确认弹窗按文件标签页展示。
+        # 使用 git diff HEAD..upstream 的 patch 输出，让 _confirm_action 中的
+        # _extract_file_diff_blocks() 能按 diff --git 块拆分为「一文件一标签页」。
+        upstream = plan.get("upstream")
+        if upstream:
+            lines.append("")
+            lines.extend(
+                self._diff_lines(
+                    pkg_dir,
+                    ["git", "diff", "--patch", f"HEAD..{upstream}"],
+                    "AI 合并 diff 预览",
+                )
+            )
         return lines, plan, ""
 
     def _git_show_text(self, pkg_dir: Path, ref: str, relpath: str) -> str | None:
-        ok, msg = self._run(["git", "show", f"{ref}:{relpath}"], cwd=pkg_dir)
-        if not ok or msg is None:
+        repo = self._repo(pkg_dir)
+        if repo is None:
             return None
-        if "\x00" in msg:
+        try:
+            blob = repo.commit(ref).tree / relpath
+            data = blob.data_stream.read()
+            if b"\x00" in data:
+                return None
+            return data.decode("utf-8")
+        except Exception:
             return None
-        return msg
 
     def _read_local_merge_text(self, pkg_dir: Path, relpath: str) -> str | None:
         disk = self._read_text_file(pkg_dir / relpath)
@@ -2159,18 +2193,34 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
             return False
 
     def _merge_head_exists(self, pkg_dir: Path) -> bool:
-        ok, _ = self._run(["git", "rev-parse", "-q", "--verify", "MERGE_HEAD"], cwd=pkg_dir)
-        return ok
+        repo = self._repo(pkg_dir)
+        if repo is None:
+            return False
+        try:
+            return (pkg_dir / ".git" / "MERGE_HEAD").exists()
+        except Exception:
+            return False
 
     def _abort_merge_if_needed(self, pkg_dir: Path):
-        if self._merge_head_exists(pkg_dir):
-            self._run(["git", "merge", "--abort"], cwd=pkg_dir)
+        repo = self._repo(pkg_dir)
+        if repo is None:
+            return
+        try:
+            repo.git.merge("--abort")
+        except Exception:
+            pass
 
     def _git_show_stage(self, pkg_dir: Path, stage: int, relpath: str) -> str | None:
-        ok, msg = self._run(["git", "show", f":{stage}:{relpath}"], cwd=pkg_dir)
-        if not ok or msg is None or "\x00" in msg:
+        repo = self._repo(pkg_dir)
+        if repo is None:
             return None
-        return msg
+        try:
+            blob = repo.git.show(f":{stage}:{relpath}")
+            if not blob or "\x00" in blob:
+                return None
+            return blob
+        except Exception:
+            return None
 
     def _read_merge_versions(
         self, pkg_dir: Path, upstream: str, merge_base: str, relpath: str
@@ -2189,11 +2239,22 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
     def _checkout_merge_side(
         self, pkg_dir: Path, side: str, upstream: str, relpath: str
     ) -> tuple[bool, str]:
-        ok, msg = self._run(["git", "checkout", side, "--", relpath], cwd=pkg_dir)
-        if ok:
-            return True, msg
-        fallback_ref = "HEAD" if side == "--ours" else upstream
-        return self._run(["git", "checkout", fallback_ref, "--", relpath], cwd=pkg_dir)
+        repo = self._repo(pkg_dir)
+        if repo is None:
+            return False, "非git仓库"
+        try:
+            if side == "--ours":
+                repo.git.checkout("--ours", "--", relpath)
+            else:
+                repo.git.checkout("--theirs", "--", relpath)
+            return True, ""
+        except Exception as exc:
+            try:
+                fallback_ref = "HEAD" if side == "--ours" else upstream
+                repo.git.checkout(fallback_ref, "--", relpath)
+                return True, ""
+            except Exception as exc2:
+                return False, str(exc2 or exc)
 
     def _execute_ai_merge(self, pkg_dir: Path, plan: dict) -> bool:
         upstream = plan["upstream"]
@@ -2244,21 +2305,33 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
                 return False
             self._log(f"[merge] {relpath} ✓ AI 合并完成")
 
-        self._run(["git", "add", "-A"], cwd=pkg_dir)
-        ok_diff, _ = self._run(["git", "diff", "--cached", "--quiet"], cwd=pkg_dir)
-        if ok_diff and not self._merge_head_exists(pkg_dir):
-            self._log(f"[info] {pkg_name} 合并后无 staged 变更")
-            return True
+        repo = self._repo(pkg_dir)
+        if repo is None:
+            return False
+        try:
+            repo.git.add(A=True)
+        except Exception as exc:
+            self._abort_merge_if_needed(pkg_dir)
+            self._log(f"[ERR] {pkg_name} add 失败: {exc}")
+            QMessageBox.warning(self, "AI 合并失败", f"add 失败:\n{exc}")
+            return False
+        try:
+            if not repo.is_dirty(index=True, working_tree=False, untracked_files=True) and not self._merge_head_exists(pkg_dir):
+                self._log(f"[info] {pkg_name} 合并后无 staged 变更")
+                return True
+        except Exception:
+            pass
         commit_msg = self._request_ai_commit_message(pkg_name, pkg_dir)
         if not commit_msg:
             commit_msg = (
                 f"merge: 同步本地与远端（AI 合并 {len(plan['both'])} 个文件）"
             )
-        ok_commit, msg_commit = self._run(["git", "commit", "-m", commit_msg], cwd=pkg_dir)
-        if not ok_commit:
+        try:
+            repo.index.commit(commit_msg)
+        except Exception as exc:
             self._abort_merge_if_needed(pkg_dir)
-            self._log(f"[ERR] {pkg_name} 合并提交失败: {msg_commit}")
-            QMessageBox.warning(self, "AI 合并失败", f"提交失败:\n{msg_commit}")
+            self._log(f"[ERR] {pkg_name} 合并提交失败: {exc}")
+            QMessageBox.warning(self, "AI 合并失败", f"提交失败:\n{exc}")
             return False
         self._log(f"[ok] {pkg_name} AI 合并已提交，可点「上传」推送")
         return True
@@ -2299,6 +2372,8 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
                 preview_lines,
                 "无文件需要合并",
                 enable_ai=False,
+                ai_merge_plan=plan,
+                ai_merge_pkg_dir=pkg_dir,
             )
             if not confirmed:
                 self._log(f"[info] {pkg_name} 取消 AI 合并")
@@ -2422,58 +2497,18 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
                       "no_remote" 无远端；"no_git" 非 git 仓库；"other" 其他失败
           - err_text: 原始 stderr 摘要（仅失败时有值）
         """
-        if not (pkg_dir / ".git").is_dir():
+        repo = self._repo(pkg_dir)
+        if repo is None:
             return False, "no_git", ""
-        git_exe = self._resolve_git_executable()
-        if not git_exe:
-            return False, "other", "git.exe not found"
-        # 检查是否配置了 origin 远端
-        prefix = self._git_config_prefix(pkg_dir)
-        run_env = os.environ.copy()
-        run_env["GIT_HTTP_CONNECT_TIMEOUT"] = str(GIT_HTTP_CONNECT_TIMEOUT_SEC)
         try:
-            url_proc = subprocess.run(
-                [git_exe, *prefix, "remote", "get-url", "origin"],
-                cwd=str(pkg_dir),
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                env=run_env,
-                timeout=5,
-                check=False,
-            )
-            if url_proc.returncode != 0:
+            if not repo.remotes or "origin" not in [r.name for r in repo.remotes]:
                 return False, "no_remote", ""
-        except Exception:
-            pass  # 继续尝试 fetch，由 fetch 结果决定
-        try:
-            proc = subprocess.run(
-                [git_exe, *prefix, "fetch", "--quiet", "--prune"],
-                cwd=str(pkg_dir),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                env=run_env,
-                timeout=GIT_FETCH_TIMEOUT_SEC,
-                check=False,
-            )
-            if proc.returncode == 0:
-                return True, "", ""
-            # 解码 stderr
-            def _dec(data: bytes | None) -> str:
-                if not data:
-                    return ""
-                for enc in ("utf-8", "gbk", sys.getdefaultencoding()):
-                    try:
-                        return data.decode(enc)
-                    except Exception:
-                        continue
-                return data.decode("utf-8", errors="replace")
-            err_text = _dec(proc.stderr).strip()
+            repo.remotes.origin.fetch(prune=True)
+            return True, "", ""
+        except Exception as exc:
+            err_text = str(exc)
             kind = self._classify_fetch_error(err_text)
             return False, kind, err_text
-        except subprocess.TimeoutExpired:
-            return False, "network", "fetch timeout"
-        except Exception as exc:
-            return False, "other", str(exc)
 
     @staticmethod
     def _classify_fetch_error(err: str) -> str:
@@ -2515,8 +2550,7 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
         if not package_entries:
             return
         total = len(package_entries)
-        self._package_refresh_bridge.log.emit(f"[阶段3] 并行 fetch 远端 ({total} 个包)")
-        t0 = time.time()
+        # 不再输出阶段标题，直接进入 fetch 流程
         workers = max(1, min(REMOTE_FETCH_MAX_WORKERS, total))
         done_count = 0
         missing = []     # 仓库不存在的包
@@ -2534,8 +2568,7 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
                 except Exception as exc:
                     ok, kind, err = False, "other", str(exc)
                 if ok:
-                    icon = "✓"
-                    line = f"  {icon} fetch [{done_count}/{total}] {pkg_name}"
+                    line = f"  ✓ fetch [{done_count}/{total}]"
                 else:
                     if kind == "not_found":
                         icon = "✗(仓库不存在)"
@@ -2550,12 +2583,11 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
                         icon = "✗"
                         failed.append(pkg_name)
                     short_err = (err or "").splitlines()[-1][:80] if err else ""
-                    line = f"  {icon} fetch [{done_count}/{total}] {pkg_name}"
+                    line = f"  {icon} fetch [{done_count}/{total}]"
                     if short_err:
                         line += f"  ({short_err})"
                 self._package_refresh_bridge.log.emit(line)
-        elapsed = time.time() - t0
-        self._package_refresh_bridge.log.emit(f"[阶段3] fetch 完成 ({elapsed:.1f}s)")
+        # fetch 完成不再输出阶段标题
         if missing:
             self._package_refresh_bridge.log.emit(
                 f"[提示] 以下 {len(missing)} 个包的远端仓库不存在（首次上传时程序会自动 gh repo create）："
@@ -2632,116 +2664,46 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
     def _scan_package_status(
         self, pkg_dir: Path, *, check_remote: bool = True, fetch_remote: bool = False
     ) -> tuple[bool, dict[str, int], dict[str, int], str]:
-        """扫描单个包状态（给包列表统计使用，不写日志）。
-
-        优化：仅用一条 git status --porcelain=v2 --branch 同时获取
-        本地文件修改状态和 ahead/behind 信息，避免多次启动子进程。
-        """
+        """扫描单个包状态（给包列表统计使用，不写日志）。"""
         empty_sync: dict[str, int] = {"ahead": 0, "behind": 0}
-        if not (pkg_dir / ".git").is_dir():
+        repo = self._repo(pkg_dir)
+        if repo is None:
             return False, {}, empty_sync, "非git仓库"
-        git_exe = self._resolve_git_executable()
-        if not git_exe:
-            return False, {}, empty_sync, "未找到git.exe"
+        try:
+            if fetch_remote:
+                try:
+                    repo.remotes.origin.fetch(prune=True)
+                except Exception:
+                    pass
 
-        # 可选：先 fetch 远端
-        if fetch_remote:
-            run_env = os.environ.copy()
-            run_env["GIT_HTTP_CONNECT_TIMEOUT"] = str(GIT_HTTP_CONNECT_TIMEOUT_SEC)
+            sync = dict(empty_sync)
             try:
-                subprocess.run(
-                    [git_exe, *self._git_config_prefix(pkg_dir), "fetch", "--quiet", "--prune"],
-                    cwd=str(pkg_dir),
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    env=run_env,
-                    timeout=GIT_FETCH_TIMEOUT_SEC,
-                    check=False,
-                )
+                if check_remote and repo.head.is_detached is False and repo.active_branch.tracking_branch() is not None:
+                    ahead, behind = repo.git.rev_list("--left-right", "--count", "HEAD...@{u}").split()
+                    sync["ahead"] = max(0, int(ahead))
+                    sync["behind"] = max(0, int(behind))
             except Exception:
                 pass
 
-        # 一条命令同时拿到分支信息 + 文件状态
-        cmd = [git_exe, *self._git_config_prefix(pkg_dir), "status", "--porcelain=v2", "--branch"]
-        try:
-            proc = subprocess.run(
-                cmd,
-                cwd=str(pkg_dir),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=15,
-                check=False,
-            )
+            counts = {"modified": 0, "untracked": 0, "conflicted": 0, "deleted": 0, "renamed": 0}
+            try:
+                for item in repo.index.diff(None):
+                    counts["modified"] += 1
+                    if item.change_type == "D":
+                        counts["deleted"] += 1
+                    if item.change_type == "R":
+                        counts["renamed"] += 1
+                counts["untracked"] = len(repo.untracked_files)
+            except Exception:
+                pass
+            try:
+                for unmerged in repo.index.unmerged_blobs().keys():
+                    counts["conflicted"] += 1
+            except Exception:
+                pass
+            return True, counts, sync, ""
         except Exception as exc:
             return False, {}, empty_sync, f"扫描失败: {exc}"
-
-        if proc.returncode != 0:
-            err = (proc.stderr or "").strip() or f"exit code={proc.returncode}"
-            return False, {}, empty_sync, f"扫描失败: {err}"
-
-        sync = dict(empty_sync)
-        counts = {
-            "modified": 0, "untracked": 0, "conflicted": 0,
-            "deleted": 0, "renamed": 0, "staged": 0,
-        }
-
-        for raw_line in (proc.stdout or "").splitlines():
-            line = raw_line.rstrip()
-            if not line:
-                continue
-
-            # 分支头信息：# branch.ab +N -M
-            if line.startswith("# branch.ab "):
-                if check_remote:
-                    parts = line.split()
-                    for p in parts:
-                        if p.startswith("+"):
-                            try:
-                                sync["ahead"] = max(0, int(p))
-                            except ValueError:
-                                pass
-                        elif p.startswith("-"):
-                            try:
-                                sync["behind"] = max(0, abs(int(p)))
-                            except ValueError:
-                                pass
-                continue
-
-            # 跳过其他 # 开头的分支元信息行
-            if line.startswith("# "):
-                continue
-
-            # 未跟踪文件
-            if line.startswith("? "):
-                counts["untracked"] += 1
-                continue
-
-            # v2 格式普通条目: "1 XY ..." 或重命名: "2 XY ..."
-            if line.startswith("1 ") or line.startswith("2 "):
-                xy = line[2:4] if len(line) >= 4 else ".."
-                x, y = xy[0], xy[1]
-                if "U" in (x, y) or (x == "A" and y == "A") or (x == "D" and y == "D"):
-                    counts["conflicted"] += 1
-                else:
-                    if x not in (".", "?"):
-                        counts["staged"] += 1
-                    if y == "M":
-                        counts["modified"] += 1
-                    elif y == "D":
-                        counts["deleted"] += 1
-                    if x == "R" or (line.startswith("2 ")):
-                        counts["renamed"] += 1
-                continue
-
-            # 冲突条目: "u XY ..."
-            if line.startswith("u "):
-                counts["conflicted"] += 1
-                continue
-
-        return True, counts, sync, ""
 
     @staticmethod
     def _format_package_status_suffix(
@@ -2752,8 +2714,6 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
         parts: list[str] = []
         if counts.get("modified", 0):
             parts.append(f"修改{counts['modified']}")
-        if counts.get("staged", 0):
-            parts.append(f"暂存{counts['staged']}")
         if counts.get("untracked", 0):
             parts.append(f"未跟踪{counts['untracked']}")
         if counts.get("deleted", 0):
@@ -2783,14 +2743,12 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
         status_map: dict[str, tuple[dict[str, int], dict[str, int], str]] = {}
         if not package_entries:
             return status_map
-        self._package_refresh_bridge.log.emit(f"[阶段4] 并行扫描 {len(package_entries)} 个包")
-        max_workers = max(1, min(8, (os.cpu_count() or 4), len(package_entries)))
+        total = len(package_entries)
+        max_workers = max(1, min(8, (os.cpu_count() or 4), total))
+        done_count = 0
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {}
-            scan_start_times = {}
             for pkg_name, pkg_dir in package_entries:
-                scan_start_times[pkg_name] = time.time()
-                self._package_refresh_bridge.log.emit(f"▶ 扫描 {pkg_name}")
                 futures[executor.submit(
                     self._scan_package_status,
                     pkg_dir,
@@ -2799,8 +2757,8 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
                 )] = pkg_name
             for future in concurrent.futures.as_completed(futures):
                 pkg_name = futures[future]
-                elapsed = time.time() - scan_start_times.get(pkg_name, time.time())
-                elapsed_str = f"{elapsed:.2f}s" if elapsed < 60 else f"{elapsed:.0f}s"
+                done_count += 1
+                self._package_refresh_bridge.log.emit(f"▶ 扫描[{done_count}/{total}]")
                 try:
                     ok, counts, sync, err = future.result()
                 except Exception as exc:
@@ -2810,8 +2768,53 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
                     sync if ok else {"ahead": 0, "behind": 0},
                     "" if ok else err,
                 )
-                icon = "✓" if ok else "✗"
-                self._package_refresh_bridge.log.emit(f"{icon} 扫描 {pkg_name} ({elapsed_str})")
+                self._package_refresh_bridge.log.emit(f"已刷新[{done_count}/{total}]")
+        return status_map
+
+    def _scan_all_package_status_streaming(
+        self,
+        package_entries: list[tuple[str, Path]],
+        *,
+        check_remote: bool = True,
+        fetch_remote: bool = False,
+        on_entry_ready=None,
+    ) -> dict[str, tuple[dict[str, int], dict[str, int], str]]:
+        """并行扫描每个包，按完成顺序即时回调 UI。"""
+        status_map: dict[str, tuple[dict[str, int], dict[str, int], str]] = {}
+        if not package_entries:
+            return status_map
+        total = len(package_entries)
+        max_workers = max(1, min(8, (os.cpu_count() or 4), total))
+        done_count = 0
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {}
+            for pkg_name, pkg_dir in package_entries:
+                futures[executor.submit(
+                    self._scan_package_status,
+                    pkg_dir,
+                    check_remote=check_remote,
+                    fetch_remote=fetch_remote,
+                )] = pkg_name
+            for future in concurrent.futures.as_completed(futures):
+                pkg_name = futures[future]
+                done_count += 1
+                self._package_refresh_bridge.log.emit(f"▶ 扫描[{done_count}/{total}]")
+                try:
+                    ok, counts, sync, err = future.result()
+                except Exception as exc:
+                    ok, counts, sync, err = False, {}, {"ahead": 0, "behind": 0}, f"扫描失败: {exc}"
+                item = (
+                    (counts if ok else {}),
+                    sync if ok else {"ahead": 0, "behind": 0},
+                    "" if ok else err,
+                )
+                status_map[pkg_name] = item
+                if on_entry_ready:
+                    try:
+                        on_entry_ready(pkg_name, ok, counts, sync, err)
+                    except Exception as exc:
+                        self._package_refresh_bridge.log.emit(f"[WARN] UI 增量更新失败 {pkg_name}: {exc}")
+                self._package_refresh_bridge.log.emit(f"已刷新[{done_count}/{total}]")
         return status_map
 
     def _style_package_status_label(
@@ -2823,7 +2826,7 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
             label.setStyleSheet("font-size: 12px; color: #d97706;")
         elif sync.get("ahead", 0):
             label.setStyleSheet("font-size: 12px; color: #2563eb;")
-        elif counts and any(counts.get(k, 0) for k in ("modified", "untracked", "deleted", "staged", "renamed", "conflicted")):
+        elif counts and any(counts.get(k, 0) for k in ("modified", "untracked", "deleted", "renamed", "conflicted")):
             # 仅本地有修改，无 ahead/behind
             label.setStyleSheet("font-size: 12px; color: #16a34a; font-weight: bold;")
         else:
@@ -2832,7 +2835,7 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
     def _apply_package_status_map(
         self, status_map: dict[str, tuple[dict[str, int], dict[str, int], str]]
     ):
-        for pkg_name, _ in self.package_entries:
+        for pkg_name, _pkg_dir, _remote_only in self.package_entries:
             label = self.package_status_labels.get(pkg_name)
             if label is None:
                 continue
@@ -2841,7 +2844,28 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
             self._style_package_status_label(label, sync, counts)
             if not err:
                 self.package_sync_map[pkg_name] = sync
+            self._update_package_row_buttons(pkg_name, sync if not err else {}, counts if not err else {}, err)
         self._update_merge_buttons()
+
+    def _apply_one_package_status(
+        self, pkg_name: str, ok: bool, counts: object, sync: object, err: str
+    ):
+        label = self.package_status_labels.get(pkg_name)
+        if label is None:
+            return
+        label.setText(
+            f"{pkg_name}{self._format_package_status_suffix(counts if ok else {}, err, sync if ok else {})}"
+        )
+        self._style_package_status_label(label, sync if ok else {}, counts if ok else None)
+        if ok:
+            self.package_sync_map[pkg_name] = sync
+        self._update_package_row_buttons(pkg_name, sync if ok else {}, counts if ok else {}, err)
+        merge_btn = self.package_merge_buttons.get(pkg_name)
+        if merge_btn is not None:
+            merge_btn.setEnabled(ok and self._is_diverged(sync))
+        refresh_btn = self.package_refresh_buttons.get(pkg_name)
+        if refresh_btn is not None:
+            refresh_btn.setEnabled(True)
 
     def _update_merge_buttons(self):
         for pkg_name, btn in self.package_merge_buttons.items():
@@ -2849,12 +2873,49 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
             diverged = self._is_diverged(sync)
             btn.setEnabled(diverged)
 
+    def _update_package_row_buttons(
+        self,
+        pkg_name: str,
+        sync: dict[str, int] | None = None,
+        counts: dict[str, int] | None = None,
+        err: str = "",
+    ):
+        buttons = self.package_row_buttons.get(pkg_name) or {}
+        upload_btn = buttons.get("upload")
+        download_btn = buttons.get("download")
+        delete_local_btn = buttons.get("delete_local")
+        delete_remote_btn = buttons.get("delete_remote")
+        web_btn = buttons.get("web")
+        busy = self._package_refresh_running
+        remote_only = any(name == pkg_name and remote_only for name, _, remote_only in self.package_entries)
+        local_exists = False
+        for name, path, _remote_only in self.package_entries:
+            if name == pkg_name:
+                local_exists = path.exists()
+                break
+        diverged = self._is_diverged(sync or {})
+        has_local_changes = bool(counts and any(counts.get(k, 0) for k in ("modified", "untracked", "deleted", "renamed", "conflicted")))
+        can_upload = (not remote_only) and local_exists and not busy and not bool(err)
+        can_download = (not busy) and (local_exists or remote_only)
+        can_delete_local = (not busy) and local_exists and not remote_only
+        can_delete_remote = (not busy) and not remote_only
+        can_web = not busy
+        if upload_btn is not None:
+            upload_btn.setEnabled(can_upload and (diverged or has_local_changes or bool(counts)))
+        if download_btn is not None:
+            download_btn.setEnabled(can_download)
+        if delete_local_btn is not None:
+            delete_local_btn.setEnabled(can_delete_local)
+        if delete_remote_btn is not None:
+            delete_remote_btn.setEnabled(can_delete_remote)
+        if web_btn is not None:
+            web_btn.setEnabled(can_web)
+
     def _update_one_package_status(self, pkg_name: str, pkg_dir: Path):
         """后台线程刷新单包状态，完成后通过信号回调更新 UI。"""
         refresh_btn = self.package_refresh_buttons.get(pkg_name)
         if refresh_btn is not None:
             refresh_btn.setEnabled(False)
-        self._log_phase_start(f"扫描 {pkg_name}")
 
         def _worker():
             ok, counts, sync, err = self._scan_package_status(
@@ -2866,29 +2927,20 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
 
         threading.Thread(target=_worker, daemon=True).start()
 
+    def _update_one_package_status_ui(
+        self, pkg_name: str, ok: bool, counts: object, sync: object, err: str
+    ):
+        self._apply_one_package_status(pkg_name, ok, counts, sync, err)
+
     def _on_one_package_status_ready(
         self, pkg_name: str, ok: bool, counts: object, sync: object, err: str
     ):
         """单包状态后台扫描完成的主线程回调。"""
+        if pkg_name == "__package_list__":
+            return
         scroll = self._list_scroll_pos()
-        label = self.package_status_labels.get(pkg_name)
-        if label is not None:
-            label.setText(
-                f"{pkg_name}{self._format_package_status_suffix(counts if ok else {}, err, sync if ok else {})}"
-            )
-            self._style_package_status_label(
-                label, sync if ok else {}, counts if ok else None)
-            if ok:
-                self.package_sync_map[pkg_name] = sync
-        merge_btn = self.package_merge_buttons.get(pkg_name)
-        if merge_btn is not None:
-            merge_btn.setEnabled(ok and self._is_diverged(sync))
-        refresh_btn = self.package_refresh_buttons.get(pkg_name)
-        if refresh_btn is not None:
-            refresh_btn.setEnabled(True)
-        self._log_phase_end(f"扫描 {pkg_name}", ok=ok)
+        self._apply_one_package_status(pkg_name, ok, counts, sync, err)
         self._restore_list_scroll(scroll)
-        self._log(f"已更新 {pkg_name} 状态。")
 
     def _open_package_in_browser(self, pkg_name: str):
         """用默认浏览器打开包对应的 GitHub 仓库页面。"""
@@ -2916,12 +2968,16 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
         token = self._package_refresh_token
         self._set_package_refresh_busy(True)
         self._log_phase_start("刷新包状态")
-        self._log("正在后台刷新包 git 状态…")
 
         def _worker():
             try:
-                status_map = self._scan_all_package_status(
-                    scannable, check_remote=True, fetch_remote=False
+                status_map = self._scan_all_package_status_streaming(
+                    scannable,
+                    check_remote=True,
+                    fetch_remote=False,
+                    on_entry_ready=lambda n, ok, counts, sync, err: self._package_refresh_bridge.one_ready.emit(
+                        n, ok, counts, sync, err
+                    ),
                 )
                 self._package_refresh_bridge.status_ready.emit(token, status_map)
             except Exception as exc:
@@ -2942,14 +2998,40 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
         self._render_package_list(local_entries, {}, loading=True)
         owner = self.owner_edit.text().strip() or "Lugwit123"
         self._log_phase_start("加载包列表")
-        self._log("正在后台加载包列表与 git 状态…")
 
         def _worker():
             try:
-                entries, status_map, warnings = self._collect_full_package_data(owner)
-                self._package_refresh_bridge.list_ready.emit(
-                    token, entries, status_map, warnings
-                )
+                local = self._local_package_entries()
+                local_names = {name for name, _ in local}
+                entries: list[tuple[str, Path, bool]] = [(name, path, False) for name, path in local]
+
+                self._package_refresh_bridge.log.emit("获取远端仓库列表…")
+                ok, remote_names, err = self._fetch_remote_repo_names_quiet(owner)
+                if ok:
+                    self._package_refresh_bridge.log.emit(f"远端仓库数: {len(remote_names)}")
+                    for name in sorted(set(remote_names), key=str.lower):
+                        if name in local_names or name in SKIP_DIRS:
+                            continue
+                        entries.append((name, self._remote_package_path(name), True))
+                elif self._resolve_gh_executable(from_manual=False):
+                    self._package_refresh_bridge.log.emit(f"[WARN] 获取远端仓库列表失败，仅显示本地包: {err}")
+
+                self._package_refresh_bridge.list_ready.emit(token, entries, {}, [])
+
+                scannable = [(name, path) for name, path, remote_only in entries if not remote_only]
+                if scannable:
+                    self._prefetch_remotes_for_packages(scannable)
+                    status_map = self._scan_all_package_status_streaming(
+                        scannable,
+                        check_remote=True,
+                        fetch_remote=False,
+                        on_entry_ready=lambda n, ok, counts, sync, err: self._package_refresh_bridge.one_ready.emit(
+                            n, ok, counts, sync, err
+                        ),
+                    )
+                else:
+                    status_map = {}
+                self._package_refresh_bridge.status_ready.emit(token, status_map)
             except Exception as exc:
                 self._package_refresh_bridge.failed.emit(token, str(exc))
 
@@ -2964,19 +3046,16 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
     ):
         if token != self._package_refresh_token:
             return
-        self._render_package_list(package_entries, status_map)
+        self._render_package_list(package_entries, status_map, loading=True)
         for line in warnings:
             self._log(line)
         local_count = sum(1 for _, _, remote_only in package_entries if not remote_only)
         remote_count = len(package_entries) - local_count
         if remote_count:
-            self._log(
-                f"已加载 {local_count} 个本地包、{remote_count} 个仅远端仓库（状态已并行扫描）。"
-            )
+            self._log(f"已渲染 {local_count} 个本地包、{remote_count} 个仅远端仓库，开始扫描。")
         else:
-            self._log(f"已加载 {local_count} 个包（状态已并行扫描）。")
-        self._log_phase_end("加载包列表")
-        self._set_package_refresh_busy(False)
+            self._log(f"已渲染 {local_count} 个包，开始扫描。")
+        self._set_package_refresh_busy(True)
 
     def _on_package_status_ready(self, token: int, status_map: dict):
         if token != self._package_refresh_token:
@@ -2984,14 +3063,12 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
         scroll = self._list_scroll_pos()
         self._apply_package_status_map(status_map)
         self._restore_list_scroll(scroll)
-        local_count = sum(
-            1 for _, _, remote_only in self.package_entries if not remote_only
-        )
-        remote_count = len(self.package_entries) - local_count
-        extra = f"，其中 {remote_count} 个仅远端" if remote_count else ""
-        self._log(f"已刷新 {local_count} 个本地包的状态{extra}。")
+        self._log("已全部刷新")
         self._log_phase_end("刷新包状态")
+        self._log_phase_end("加载包列表")
         self._set_package_refresh_busy(False)
+        self._update_merge_buttons()
+        self._restore_list_scroll(scroll)
 
     def _on_package_refresh_failed(self, token: int, message: str):
         if token != self._package_refresh_token:
@@ -3014,6 +3091,7 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
             if w:
                 w.deleteLater()
         self.row_buttons = []
+        self.package_row_buttons = {}
         self.package_status_labels = {}
         self.package_sync_map = {}
         self.package_merge_buttons = {}
@@ -3085,29 +3163,7 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
             row_lay.addWidget(btn_down)
             self.row_buttons.append(btn_down)
 
-            diverged = (not remote_only) and self._is_diverged(
-                self.package_sync_map.get(pkg_name, {})
-            )
-            btn_merge = QPushButton("AI合并")
-            btn_merge.setFocusPolicy(Qt.NoFocus)
-            btn_merge.setProperty("class", "merge-btn")
-            btn_merge.setMinimumHeight(20)
-            btn_merge.setMaximumWidth(64)
-            btn_merge.setToolTip(
-                "本地独有→保留本地；远端独有→取远端；双方都改→AI 合并后提交"
-            )
-            if remote_only or not diverged:
-                btn_merge.setEnabled(False)
-                if not remote_only:
-                    btn_merge.setToolTip("需同时「本地领先」且「远端领先」（分叉）时可用")
-            else:
-                btn_merge.clicked.connect(lambda _=False, p=pkg_dir: self.merge_one_ai(p))
-            if row_busy:
-                btn_merge.setEnabled(False)
-            row_lay.addWidget(btn_merge)
-            self.row_buttons.append(btn_merge)
-            if not remote_only:
-                self.package_merge_buttons[pkg_name] = btn_merge
+            # 已移除单独的「AI合并」按钮：合并能力并入「下载」流程中处理。
 
             local_exists = pkg_dir.exists()
             btn_del_local = QPushButton("删本地")
@@ -3170,6 +3226,15 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
             row_lay.addWidget(btn_web)
             self.row_buttons.append(btn_web)
 
+            self.package_row_buttons[pkg_name] = {
+                "upload": btn_up,
+                "download": btn_down,
+                "delete_local": btn_del_local,
+                "delete_remote": btn_del_remote,
+                "refresh": btn_refresh,
+                "web": btn_web,
+            }
+
             self.list_layout.addWidget(row)
             sep = QFrame()
             sep.setFrameShape(QFrame.HLine)
@@ -3180,11 +3245,19 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
     def _ensure_git_repo(self, pkg_dir: Path) -> bool:
         if (pkg_dir / ".git").is_dir():
             return True
-        ok, msg = self._run(["git", "init", "-b", "main"], cwd=pkg_dir)
-        if not ok:
-            self._log(f"[ERR] {pkg_dir.name} git init 失败: {msg}")
-            return False
-        self._run(["git", "config", "core.longpaths", "true"], cwd=pkg_dir)
+        repo = self._repo(pkg_dir)
+        if repo is None:
+            try:
+                Repo.init(str(pkg_dir), initial_branch="main")
+            except Exception as exc:
+                self._log(f"[ERR] {pkg_dir.name} git init 失败: {exc}")
+                return False
+        try:
+            repo = self._repo(pkg_dir)
+            if repo is not None:
+                repo.git.config("core.longpaths", "true")
+        except Exception:
+            pass
         return True
 
     def _ensure_gitignore(self, pkg_dir: Path):
@@ -3210,47 +3283,20 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
         self, pkg_dir: Path, upstream_ref: str | None = None
     ) -> list[tuple[str, int]]:
         """列出即将 push 的提交中超过 GitHub 限制（100MB）的 blob。"""
-        git_exe = self._resolve_git_executable()
-        if not git_exe:
+        repo = self._repo(pkg_dir)
+        if repo is None:
             return []
-        rev_range = f"{upstream_ref}..HEAD" if upstream_ref else "HEAD"
         try:
-            rev_proc = subprocess.run(
-                [git_exe, "rev-list", "--objects", rev_range],
-                cwd=str(pkg_dir),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=120,
-                check=False,
-            )
-            if rev_proc.returncode != 0 or not (rev_proc.stdout or "").strip():
+            rev_range = f"{upstream_ref}..HEAD" if upstream_ref else "HEAD"
+            rev_list = repo.git.rev_list("--objects", rev_range)
+            if not (rev_list or "").strip():
                 return []
-            cat_proc = subprocess.run(
-                [
-                    git_exe,
-                    "cat-file",
-                    "--batch-check=%(objecttype) %(objectname) %(objectsize) %(rest)",
-                ],
-                cwd=str(pkg_dir),
-                input=rev_proc.stdout,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=120,
-                check=False,
-            )
+            cat_out = repo.git.cat_file("--batch-check=%(objecttype) %(objectname) %(objectsize) %(rest)", input=rev_list)
         except Exception as exc:
             self._log(f"[WARN] 扫描大文件失败: {exc}")
             return []
-        if cat_proc.returncode != 0:
-            return []
         oversized: list[tuple[str, int]] = []
-        for line in (cat_proc.stdout or "").splitlines():
+        for line in (cat_out or "").splitlines():
             parts = line.split(maxsplit=3)
             if len(parts) < 4 or parts[0] != "blob":
                 continue
@@ -3426,37 +3472,32 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
         )
         return confirm == QMessageBox.Yes
 
-    def _force_download_workspace(self, pkg_dir: Path, pkg_name: str) -> bool:
+    def _force_download_workspace(self, pkg_dir: Path, pkg_name: str, upstream_ref: str | None = None) -> bool:
         """fetch + reset --hard + clean -fd 强制同步远端到本地。"""
-        ok_fetch, msg_fetch = self._run(["git", "fetch", "--all", "--prune"], cwd=pkg_dir)
-        if not ok_fetch:
-            self._log(f"[ERR] {pkg_name} fetch 失败: {msg_fetch}")
-            QMessageBox.warning(self, "下载失败", f"{pkg_name} fetch 失败:\n{msg_fetch}")
+        repo = self._repo(pkg_dir)
+        if repo is None:
+            self._log(f"[ERR] {pkg_name} 不是 git 仓库")
+            QMessageBox.warning(self, "下载失败", f"{pkg_name} 不是 git 仓库。")
             return False
+        try:
+            if repo.remotes and any(r.name == "origin" for r in repo.remotes):
+                repo.remotes.origin.fetch(prune=True)
+            else:
+                self._log(f"[warn] {pkg_name} 未找到 origin，跳过 fetch")
 
-        ok_up, upstream = self._run(
-            ["git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"], cwd=pkg_dir
-        )
-        if ok_up and upstream.strip():
-            target_ref = upstream.strip().splitlines()[-1]
-        else:
-            target_ref = f"origin/{self._current_branch(pkg_dir)}"
-            self._log(f"[warn] {pkg_name} 无上游分支，回退使用 {target_ref}")
+            target_ref = upstream_ref or self._upstream_ref(pkg_dir)
+            if not target_ref:
+                try:
+                    target_ref = f"origin/{repo.active_branch.name}"
+                except Exception:
+                    target_ref = "origin/main"
+                self._log(f"[warn] {pkg_name} 无上游分支，回退使用 {target_ref}")
 
-        ok_reset, msg_reset = self._run(["git", "reset", "--hard", target_ref], cwd=pkg_dir)
-        if not ok_reset:
-            self._log(f"[ERR] {pkg_name} reset --hard 失败: {msg_reset}")
-            QMessageBox.warning(
-                self,
-                "下载失败",
-                f"{pkg_name} reset --hard {target_ref} 失败:\n{msg_reset}",
-            )
-            return False
-
-        ok_clean, msg_clean = self._run(["git", "clean", "-fd"], cwd=pkg_dir)
-        if not ok_clean:
-            self._log(f"[ERR] {pkg_name} clean -fd 失败: {msg_clean}")
-            QMessageBox.warning(self, "下载失败", f"{pkg_name} clean -fd 失败:\n{msg_clean}")
+            repo.git.reset("--hard", target_ref)
+            repo.git.clean("-fd")
+        except Exception as exc:
+            self._log(f"[ERR] {pkg_name} 强制下载失败: {exc}")
+            QMessageBox.warning(self, "下载失败", f"{pkg_name} 强制下载失败:\n{exc}")
             return False
 
         self._log(f"[ok] {pkg_name} 强制下载完成（已覆盖本地）")
@@ -3469,7 +3510,16 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
         return clipped
 
     def _confirm_action(
-        self, title: str, pkg_name: str, lines: list[str], fallback: str, enable_ai: bool = False
+        self,
+        title: str,
+        pkg_name: str,
+        lines: list[str],
+        fallback: str,
+        enable_ai: bool = False,
+        ai_merge_plan: dict | None = None,
+        ai_merge_pkg_dir: Path | None = None,
+        file_apply_pkg_dir: Path | None = None,
+        file_apply_upstream_ref: str | None = None,
     ) -> tuple[bool, str | None]:
         preview = [x for x in lines if x.strip()]
         if not preview:
@@ -3544,13 +3594,179 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
         self._apply_diff_highlight(overview)
         tabs.addTab(overview, "总览")
 
+        upstream_ref = (file_apply_upstream_ref or "").strip()
+        can_apply_single_file = bool(file_apply_pkg_dir and upstream_ref)
+
         file_blocks = self._extract_file_diff_blocks(preview)
         for file_name, block in file_blocks:
+            # 尝试从 diff block 解析相对路径，用于“单文件合并到本地”
+            relpath: str | None = None
+            first = (block.splitlines()[0].strip() if block else "")
+            if first.startswith("diff --git "):
+                parts = first.split()
+                if len(parts) >= 4 and parts[2].startswith("a/"):
+                    relpath = parts[2][2:]
+
+            file_tab = QWidget(dlg)
+            file_lay = QVBoxLayout(file_tab)
+            file_lay.setContentsMargins(0, 0, 0, 0)
+            file_lay.setSpacing(8)
+
+            if can_apply_single_file and relpath:
+                bar = QHBoxLayout()
+                bar.setSpacing(8)
+                btn_apply = QPushButton("仅合并该文件到本地（取远端版本）")
+                lbl_apply = QLabel("将远端版本写入本地工作区（不执行整体下载/合并流程）。")
+                lbl_apply.setWordWrap(True)
+                bar.addWidget(btn_apply)
+                bar.addWidget(lbl_apply, 1)
+                file_lay.addLayout(bar)
+
+                def _apply_one(_checked=False, _relpath=relpath):
+                    btn_apply.setEnabled(False)
+                    lbl_apply.setText("应用中…")
+
+                    def _worker():
+                        ok, msg = self._run(
+                            ["git", "checkout", upstream_ref, "--", _relpath],
+                            cwd=file_apply_pkg_dir,
+                        )
+                        if ok:
+                            lbl_apply.setText("已写入本地工作区。")
+                            self._log(f"[ok] 单文件写入本地: {_relpath} ← {upstream_ref}")
+                        else:
+                            lbl_apply.setText("应用失败。")
+                            QMessageBox.warning(
+                                dlg,
+                                "单文件合并到本地失败",
+                                f"{pkg_name}\n文件: {_relpath}\nref: {upstream_ref}\n\n{msg}",
+                            )
+                        btn_apply.setEnabled(True)
+
+                    threading.Thread(target=_worker, daemon=True).start()
+
+                btn_apply.clicked.connect(_apply_one)
+
             editor = QTextEdit(dlg)
             editor.setReadOnly(True)
             editor.setPlainText(block)
             self._apply_diff_highlight(editor)
-            tabs.addTab(editor, self._safe_tab_name(file_name))
+            file_lay.addWidget(editor, 1)
+            tabs.addTab(file_tab, self._safe_tab_name(file_name))
+
+        # ---- AI 合并：为需要合并（双方都改）的文件增加“合并结果预览”页 ----
+        if ai_merge_plan and ai_merge_pkg_dir:
+            try:
+                both_files = list(ai_merge_plan.get("both") or [])
+                upstream = (ai_merge_plan.get("upstream") or "").strip()
+                merge_base = (ai_merge_plan.get("merge_base") or "").strip()
+            except Exception:
+                both_files, upstream, merge_base = [], "", ""
+
+            if both_files and upstream and merge_base:
+                preview_bridge = _AiMergePreviewBridge()
+                preview_widgets: dict[
+                    str, tuple[QPushButton, QLabel, QTextEdit, QPushButton, dict]
+                ] = {}
+
+                def _on_preview_ready(relpath: str, ok: bool, text: str):
+                    w = preview_widgets.get(relpath)
+                    if not w:
+                        return
+                    btn, status, editor, btn_write, state = w
+                    btn.setEnabled(True)
+                    if ok:
+                        status.setText("已生成合并预览（未写入磁盘）。")
+                        editor.setPlainText(text or "")
+                        state["merged"] = text or ""
+                        btn_write.setEnabled(True)
+                    else:
+                        status.setText("生成失败。")
+                        editor.setPlainText(text or "生成失败（无错误信息）")
+                        state["merged"] = ""
+                        btn_write.setEnabled(False)
+
+                preview_bridge.finished.connect(_on_preview_ready)
+
+                for relpath in both_files:
+                    file_tab = QWidget(dlg)
+                    file_lay = QVBoxLayout(file_tab)
+                    file_lay.setContentsMargins(0, 0, 0, 0)
+                    file_lay.setSpacing(8)
+
+                    top_bar = QHBoxLayout()
+                    top_bar.setSpacing(8)
+                    btn_preview = QPushButton("生成合并结果预览")
+                    btn_write = QPushButton("将合并结果写入本地")
+                    btn_write.setEnabled(False)
+                    lbl_status = QLabel("此文件存在冲突需要合并。点击按钮生成 AI 合并后的结果预览（不落盘）。")
+                    lbl_status.setWordWrap(True)
+                    top_bar.addWidget(btn_preview)
+                    top_bar.addWidget(btn_write)
+                    top_bar.addWidget(lbl_status, 1)
+                    file_lay.addLayout(top_bar)
+
+                    preview_edit = QTextEdit(dlg)
+                    preview_edit.setReadOnly(True)
+                    preview_edit.setPlaceholderText("合并结果预览将显示在这里。")
+                    file_lay.addWidget(preview_edit, 1)
+
+                    state = {"merged": ""}
+                    preview_widgets[relpath] = (btn_preview, lbl_status, preview_edit, btn_write, state)
+
+                    def _start_generate(_checked=False, _relpath=relpath):
+                        btn, status, editor = preview_widgets.get(_relpath, (None, None, None))
+                        if not btn or not status or not editor:
+                            return
+                        btn.setEnabled(False)
+                        status.setText("生成中…（可能需要几十秒）")
+                        editor.setPlainText("")
+
+                        def _worker():
+                            try:
+                                local_text, remote_text, base_text = self._read_merge_versions(
+                                    ai_merge_pkg_dir, upstream, merge_base, _relpath
+                                )
+                                if local_text is None or remote_text is None:
+                                    preview_bridge.finished.emit(
+                                        _relpath,
+                                        False,
+                                        "无法读取本地/远端版本（可能为二进制文件或 git 无法读取）。",
+                                    )
+                                    return
+                                ok, merged = self._ai_merge_file_content(
+                                    _relpath, local_text, remote_text, base_text
+                                )
+                                preview_bridge.finished.emit(_relpath, ok, merged)
+                            except Exception as exc:
+                                preview_bridge.finished.emit(_relpath, False, f"异常：{exc}")
+
+                        threading.Thread(target=_worker, daemon=True).start()
+
+                    btn_preview.clicked.connect(_start_generate)
+
+                    def _write_to_local(_checked=False, _relpath=relpath):
+                        w = preview_widgets.get(_relpath)
+                        if not w:
+                            return
+                        _, status, _, btn_w, st = w
+                        merged = (st.get("merged") or "").rstrip("\n")
+                        if not merged:
+                            QMessageBox.information(dlg, "写入失败", f"{_relpath}\n尚未生成合并结果预览。")
+                            return
+                        btn_w.setEnabled(False)
+                        status.setText("写入本地中…")
+                        ok = self._write_merged_file(ai_merge_pkg_dir, _relpath, merged + "\n")
+                        if ok:
+                            status.setText("已写入本地工作区（未提交）。")
+                            self._log(f"[ok] AI 合并结果写入本地: {_relpath}")
+                        else:
+                            status.setText("写入失败。")
+                            QMessageBox.warning(dlg, "写入失败", f"{_relpath}\n写入本地失败，请查看日志。")
+                        btn_w.setEnabled(True)
+
+                    btn_write.clicked.connect(_write_to_local)
+                    tabs.addTab(file_tab, self._safe_tab_name(f"[合并预览] {Path(relpath).name}"))
 
         main_content_splitter = QSplitter(Qt.Horizontal, dlg)
         main_content_splitter.setChildrenCollapsible(False)
@@ -3886,6 +4102,17 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
         self._append_local_pending_preview(out, pkg_dir, ok_status, status_lines)
         return out
 
+    def _preview_package_list_progress(self, package_entries: list[tuple[str, Path, bool]], ready: set[str]):
+        if not self.list_layout:
+            return
+        for pkg_name, _, remote_only in package_entries:
+            if remote_only or pkg_name in ready:
+                continue
+            label = self.package_status_labels.get(pkg_name)
+            if label is not None:
+                label.setText(f"{pkg_name} [扫描中…]")
+                label.setStyleSheet("font-size: 12px; color: #9aa0a6;")
+
     def _log_upload_summary(self, pkg_dir: Path, pkg_name: str) -> None:
         """上传成功后显示提交注释和文件列表。"""
         # 获取最新 commit message
@@ -4003,6 +4230,40 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
                 "远端将带来的修改 diff",
             )
         )
+        return out
+
+    def _preview_force_download_conflicts(self, pkg_dir: Path, upstream_ref: str | None = None) -> list[str]:
+        """展示强制覆盖前的本地冲突详情：本地未提交改动 + 与远端的差异。"""
+        out: list[str] = []
+        ok_status, status_lines = self._status_lines(pkg_dir)
+        if ok_status:
+            out.append("[本地未提交改动]")
+            local_pending = self._format_status_lines_with_full_path(pkg_dir, status_lines)
+            out.extend(local_pending or ["(无本地未提交改动)"])
+            if local_pending:
+                out.append("")
+                out.extend(self._local_uncommitted_diff_lines(pkg_dir, status_lines))
+        else:
+            out.append("[本地未提交改动] 获取失败")
+            out.extend(status_lines)
+
+        out.append("")
+        ok_up, upstream = self._run(
+            ["git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"], cwd=pkg_dir
+        )
+        upstream_text = upstream_ref or (upstream.strip().splitlines()[-1] if ok_up and upstream and upstream.strip() else "")
+        if upstream_text:
+            out.append(f"[远端将覆盖到的版本] {upstream_text}")
+            out.append("")
+            out.extend(
+                self._diff_lines(
+                    pkg_dir,
+                    ["git", "diff", "--patch", f"HEAD..{upstream_text}"],
+                    "远端将带来的修改 diff",
+                )
+            )
+        else:
+            out.append("[远端将覆盖到的版本] 无上游分支，后续会回退到 origin/<当前分支>")
         return out
 
     def upload_one(self, pkg_dir: Path):
@@ -4185,8 +4446,18 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
                 return
 
             download_preview = self._preview_download_files(pkg_dir)
+            ok_up, upstream = self._run(
+                ["git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"], cwd=pkg_dir
+            )
+            upstream_ref = upstream.strip().splitlines()[-1] if ok_up and upstream and upstream.strip() else ""
             confirmed, _ = self._confirm_action(
-                "确认下载", pkg_name, download_preview, "无远端文件变化", enable_ai=False
+                "确认下载",
+                pkg_name,
+                download_preview,
+                "无远端文件变化",
+                enable_ai=False,
+                file_apply_pkg_dir=pkg_dir,
+                file_apply_upstream_ref=upstream_ref,
             )
             if not confirmed:
                 self._log(f"[info] {pkg_name} 取消下载")
@@ -4197,8 +4468,11 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
                 return
 
             self._log(f"[warn] {pkg_name} pull --ff-only 失败: {msg_pull}")
+
+            # 合并能力并入「下载」：当处于分叉（双方均有提交）或需要合并时，提供 AI 合并确认并执行。
+            # 仅对双方都改的文件显示「合并预览」标签页；对仅远端改动的文件仅显示 diff 标签页。
             if self._ask_force_download(pkg_name, msg_pull):
-                self._force_download_workspace(pkg_dir, pkg_name)
+                self._force_download_workspace(pkg_dir, pkg_name, upstream_ref=upstream_ref)
             else:
                 self._log(f"[info] {pkg_name} 用户取消强制下载")
                 QMessageBox.warning(self, "下载失败", f"{pkg_name} pull 失败:\n{msg_pull}")

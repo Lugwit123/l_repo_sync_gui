@@ -10,6 +10,7 @@ requires = [
     "pyside6",
     "l_qt_wgt_lib",
     "pytracemp",
+    "gitpython",
 ]
 
 
