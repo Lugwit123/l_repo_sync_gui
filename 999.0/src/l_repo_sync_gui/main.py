@@ -18,6 +18,8 @@ import urllib.request
 
 from git import Repo
 
+from l_repo_sync_gui import git_helper, github_helper
+
 try:
     import winreg  # 用于读取 Windows IE 代理
 except ImportError:
@@ -326,6 +328,16 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
         self.owner_edit = central.findChild(QLineEdit, "owner_edit")
         self.git_path_edit = central.findChild(QLineEdit, "git_path_edit")
         self.gh_path_edit = central.findChild(QLineEdit, "gh_path_edit")
+        lbl_gh = central.findChild(QLabel, "lbl_gh")
+        if lbl_gh is not None:
+            lbl_gh.setVisible(False)
+        if self.gh_path_edit is not None:
+            self.gh_path_edit.setVisible(False)
+        lbl_git = central.findChild(QLabel, "lbl_git")
+        if lbl_git is not None:
+            lbl_git.setVisible(False)
+        if self.git_path_edit is not None:
+            self.git_path_edit.setVisible(False)
         self.gh_token_edit = central.findChild(QLineEdit, "gh_token_edit")
         self.btn_model_settings = central.findChild(QPushButton, "btn_model_settings")
         self.model_edit = central.findChild(QComboBox, "model_edit")
@@ -433,27 +445,11 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
         self._net_test_bridge.finished.connect(self._on_network_test_finished)
         self._net_test_running = False
     
-        self._init_gh_path()
         self._load_auth_settings()
         self._load_network_settings()
 
-    def _init_gh_path(self):
-        """初始化 git/gh 路径输入框：优先环境变量，其次自动探测。"""
-        env_git = (os.environ.get("GIT_EXE_PATH") or "").strip()
-        if env_git:
-            self.git_path_edit.setText(env_git)
-        else:
-            auto_git = self._resolve_git_executable(from_manual=False)
-            if auto_git:
-                self.git_path_edit.setText(auto_git)
-
-        env_gh = (os.environ.get("GH_EXE_PATH") or "").strip()
-        if env_gh:
-            self.gh_path_edit.setText(env_gh)
-            return
-        auto = self._resolve_gh_executable(from_manual=False)
-        if auto:
-            self.gh_path_edit.setText(auto)
+    def _github_token(self) -> str:
+        return (self.gh_token_edit.text() or "").strip()
 
     def _load_auth_settings(self):
         """加载本地 GitHub token 配置。"""
@@ -588,28 +584,10 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
                 result.append(x)
         return ",".join(result)
 
-    def _apply_git_http_version(self, version: str, git_exe: str | None):
-        """应用 git http.version 配置。version 为空字符串时清除配置。"""
-        if not git_exe:
-            return
+    def _apply_git_http_version(self, version: str):
+        """应用 git http.version 全局配置。version 为空字符串时清除配置。"""
         try:
-            if version:
-                subprocess.run(
-                    [git_exe, "config", "--global", "http.version", version],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    check=False,
-                    timeout=10,
-                )
-            else:
-                # 未选中时尝试恢复默认（取消设置）
-                subprocess.run(
-                    [git_exe, "config", "--global", "--unset", "http.version"],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    check=False,
-                    timeout=10,
-                )
+            git_helper.apply_global_http_version(version)
         except Exception:
             pass
 
@@ -687,45 +665,19 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
                     os.environ["NO_PROXY"] = no_proxy
                     os.environ["no_proxy"] = no_proxy
 
-            git_exe = self._resolve_git_executable()
+            # 根据模式决定 git 全局代理（GitPython 写 ~/.gitconfig）
+            effective_git_proxy = ""
+            if proxy_mode == "ie" and (http_proxy or https_proxy):
+                effective_git_proxy = https_proxy or http_proxy
+            elif proxy_mode == "custom" and apply_git and git_proxy:
+                effective_git_proxy = git_proxy
 
-            # 根据模式决定 git 全局代理
-            # - none：清除 git 全局代理
-            # - ie：将解析到的代理写入 git 全局
-            # - custom：仅当用户勾选 "启用 git 代理" 时才写入
-            if git_exe:
-                effective_git_proxy = ""
-                if proxy_mode == "ie" and (http_proxy or https_proxy):
-                    effective_git_proxy = https_proxy or http_proxy
-                elif proxy_mode == "custom" and apply_git and git_proxy:
-                    effective_git_proxy = git_proxy
+            if effective_git_proxy:
+                git_helper.apply_global_proxy(effective_git_proxy, effective_git_proxy)
+            else:
+                git_helper.apply_global_proxy(None, None)
 
-                if effective_git_proxy:
-                    subprocess.run(
-                        [git_exe, "config", "--global", "http.proxy", effective_git_proxy],
-                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                        check=False, timeout=10,
-                    )
-                    subprocess.run(
-                        [git_exe, "config", "--global", "https.proxy", effective_git_proxy],
-                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                        check=False, timeout=10,
-                    )
-                else:
-                    # 清除全局 git 代理
-                    subprocess.run(
-                        [git_exe, "config", "--global", "--unset", "http.proxy"],
-                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                        check=False, timeout=10,
-                    )
-                    subprocess.run(
-                        [git_exe, "config", "--global", "--unset", "https.proxy"],
-                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                        check=False, timeout=10,
-                    )
-
-            # 写入全局 git http.version
-            self._apply_git_http_version(http_version, git_exe)
+            self._apply_git_http_version(http_version)
 
             self._log(
                 f"[ok] 已应用网络配置: "
@@ -1235,7 +1187,7 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
         dlg.exec()
 
     def _check_github_auth(self):
-        ok, msg = self._run(["gh", "auth", "status"])
+        ok, msg = github_helper.check_auth(self._github_token())
         if ok:
             QMessageBox.information(self, "GitHub 授权状态", msg or "已授权。")
         else:
@@ -1259,21 +1211,10 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
                 lines.append(f"  {key}={val}")
         if not lines:
             lines.append("  (未设置 HTTP/HTTPS/ALL_PROXY 环境变量)")
-        git_exe = self._resolve_git_executable()
-        if git_exe:
-            for cfg in ("http.proxy", "https.proxy"):
-                proc = subprocess.run(
-                    [git_exe, "config", "--global", "--get", cfg],
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    timeout=5,
-                    check=False,
-                )
-                val = (proc.stdout or "").strip()
-                if proc.returncode == 0 and val:
-                    lines.append(f"  git global {cfg}={val}")
+        for cfg in ("http.proxy", "https.proxy"):
+            val = git_helper.global_config_get(cfg)
+            if val:
+                lines.append(f"  git global {cfg}={val}")
         return lines
 
     @staticmethod
@@ -1293,42 +1234,14 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
     def _probe_git_ls_remote_once(
         self, repo_url: str, timeout_sec: int = 30
     ) -> tuple[bool, int, str]:
-        git_exe = self._resolve_git_executable()
-        if not git_exe:
-            return False, 0, "未找到 git.exe"
-        cmd = [
-            git_exe,
-            *self._git_config_prefix(),
-            "ls-remote",
-            repo_url,
-            "HEAD",
-        ]
-        env = os.environ.copy()
-        env["GIT_HTTP_CONNECT_TIMEOUT"] = str(GIT_HTTP_CONNECT_TIMEOUT_SEC)
         start = time.perf_counter()
-        try:
-            proc = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=timeout_sec,
-                env=env,
-                check=False,
-            )
-        except subprocess.TimeoutExpired:
-            return False, timeout_sec * 1000, f"超时 ({timeout_sec}s)"
-        except Exception as exc:
-            return False, int((time.perf_counter() - start) * 1000), str(exc)
+        ok, detail = git_helper.ls_remote(repo_url, "HEAD", timeout_sec=timeout_sec)
         ms = int((time.perf_counter() - start) * 1000)
-        merged = "\n".join(
-            x for x in [(proc.stdout or "").strip(), (proc.stderr or "").strip()] if x
-        )
-        if proc.returncode != 0:
-            return False, ms, merged or f"exit code={proc.returncode}"
-        head = (proc.stdout or "").strip().splitlines()[0] if proc.stdout else ""
-        return True, ms, head or "(empty)"
+        if ok:
+            return True, ms, detail
+        if "timeout" in (detail or "").lower() or "timed out" in (detail or "").lower():
+            return False, timeout_sec * 1000, f"超时 ({timeout_sec}s)"
+        return False, ms, detail
 
     def _probe_git_ls_remote(
         self, repo_url: str, timeout_sec: int = 30, retries: int = 3
@@ -1357,8 +1270,9 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
     def _test_network_connection(self):
         if self._net_test_running:
             return
-        if not self._resolve_git_executable():
-            QMessageBox.warning(self, "网络测试", "未找到 git.exe，请先设置路径。")
+        ok_git, msg_git = git_helper.check_git_available()
+        if not ok_git:
+            QMessageBox.warning(self, "网络测试", f"Git 不可用（GitPython）:\n{msg_git}")
             return
         self._net_test_running = True
         self.btn_test_network.setEnabled(False)
@@ -1442,78 +1356,27 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
             break
 
     def _start_gh_auth_login(self):
-        gh_exe = self._resolve_gh_executable()
-        if not gh_exe:
-            QMessageBox.warning(self, "启动失败", "未找到 gh.exe，请先设置路径。")
-            return
+        """打开 GitHub Token 创建页，引导用户粘贴 Token。"""
         try:
-            subprocess.Popen(
-                [
-                    gh_exe,
-                    "auth",
-                    "login",
-                    "--web",
-                    "--clipboard",
-                    "--hostname",
-                    "github.com",
-                    "--git-protocol",
-                    "https",
-                ],
-                shell=False,
-                creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0x00000010),
-            )
-            self._log("[info] 已启动网页登录授权（已复制授权码到剪贴板并打开网页）。")
+            webbrowser.open(github_helper.TOKEN_CREATE_URL)
         except Exception as exc:
-            self._log(f"[ERR] 启动 gh auth login 失败: {exc}")
-            QMessageBox.warning(self, "启动失败", str(exc))
-
-    def _resolve_git_executable(self, from_manual: bool = True) -> str | None:
-        """保留给旧逻辑兼容使用；GitPython 优先，不再依赖 git.exe。"""
-        manual = (self.git_path_edit.text() or "").strip() if from_manual else ""
-        if manual and os.path.isfile(manual):
-            return manual
-        which_git = shutil.which("git")
-        if which_git and os.path.isfile(which_git):
-            return which_git
-        default_paths = [
-            r"C:\Program Files\Git\cmd\git.exe",
-            r"C:\Program Files\Git\bin\git.exe",
-            r"C:\Program Files (x86)\Git\cmd\git.exe",
-            r"C:\Program Files (x86)\Git\bin\git.exe",
-        ]
-        for p in default_paths:
-            if os.path.isfile(p):
-                return p
-        return None
+            self._log(f"[ERR] 打开浏览器失败: {exc}")
+        QMessageBox.information(
+            self,
+            "GitHub 授权",
+            (
+                "已尝试打开 GitHub Token 创建页面。\n\n"
+                "1) 生成 Personal Access Token（需 repo 权限）\n"
+                "2) 复制 Token 粘贴到上方「GitHub Token」输入框\n"
+                "3) 点击「保存 Token」\n"
+                "4) 点击「授权状态」验证\n\n"
+                f"链接:\n{github_helper.TOKEN_CREATE_URL}"
+            ),
+        )
+        self._log("[info] 已打开 GitHub Token 创建页面，请粘贴 Token 并保存。")
 
     def _repo(self, pkg_dir: Path) -> Repo | None:
-        try:
-            if not (pkg_dir / ".git").is_dir():
-                return None
-            return Repo(str(pkg_dir))
-        except Exception:
-            return None
-
-    def _resolve_gh_executable(self, from_manual: bool = True) -> str | None:
-        """返回可执行 gh 路径（优先用户输入）。"""
-        manual = (self.gh_path_edit.text() or "").strip() if from_manual else ""
-        if manual:
-            if os.path.isfile(manual):
-                return manual
-            return None
-
-        which_gh = shutil.which("gh")
-        if which_gh and os.path.isfile(which_gh):
-            return which_gh
-
-        default_paths = [
-            r"C:\Program Files\GitHub CLI\gh.exe",
-            r"C:\Program Files (x86)\GitHub CLI\gh.exe",
-        ]
-        for p in default_paths:
-            if os.path.isfile(p):
-                return p
-        return None
+        return git_helper.open_repo(pkg_dir)
 
     def _list_scroll_pos(self) -> int:
         bar = self.list_area.verticalScrollBar()
@@ -1551,55 +1414,24 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
         if not cmd:
             return False, "empty command"
 
-        effective_cmd = list(cmd)
         if cmd[0] == "git":
-            git_exe = self._resolve_git_executable()
-            if not git_exe:
-                return False, "git.exe not found"
             repo_safe = safe_dir if safe_dir is not None else cwd
-            effective_cmd = [git_exe, *self._git_config_prefix(repo_safe), *cmd[1:]]
-        elif cmd[0] == "gh":
-            gh_exe = self._resolve_gh_executable()
-            if not gh_exe:
-                return False, "gh.exe not found"
-            effective_cmd[0] = gh_exe
-
-        run_env = os.environ.copy()
-        if cmd[0] == "git":
-            run_env["GIT_HTTP_CONNECT_TIMEOUT"] = str(GIT_HTTP_CONNECT_TIMEOUT_SEC)
-        gh_token = (self.gh_token_edit.text() or "").strip()
-        if gh_token:
-            run_env["GH_TOKEN"] = gh_token
-            run_env["GITHUB_TOKEN"] = gh_token
-        try:
-            proc = subprocess.run(
-                effective_cmd,
-                cwd=str(cwd) if cwd else None,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                env=run_env,
+            git_args = cmd[1:]
+            if len(git_args) >= 2 and git_args[0] == "clone":
+                return git_helper.clone_from(
+                    git_args[1],
+                    Path(git_args[2]),
+                    safe_dir=repo_safe,
+                    timeout=timeout,
+                )
+            return git_helper.execute_git(
+                git_args,
+                cwd=cwd,
+                repo_dir=repo_safe,
                 timeout=timeout,
-                check=False,
             )
-        except Exception as exc:
-            return False, str(exc)
 
-        def _decode_output(data: bytes | None) -> str:
-            if not data:
-                return ""
-            for enc in ("utf-8", "gbk", sys.getdefaultencoding()):
-                try:
-                    return data.decode(enc)
-                except Exception:
-                    continue
-            return data.decode("utf-8", errors="replace")
-
-        out = _decode_output(proc.stdout).strip()
-        err = _decode_output(proc.stderr).strip()
-        merged = "\n".join(x for x in [out, err] if x)
-        if proc.returncode != 0:
-            return False, merged or f"exit code={proc.returncode}"
-        return True, merged
+        return False, f"unsupported command: {cmd[0]}"
 
     def _log(self, text: str):
         """输出日志到 GUI、终端和日志文件。"""
@@ -1659,18 +1491,6 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
         icon = "\u2713" if ok else "\u2717"
         self._log(f"{icon} {phase}{elapsed}")
 
-    @staticmethod
-    def _git_config_prefix(repo_dir: Path | None = None) -> list[str]:
-        """git 单次调用参数：不写入全局 gitconfig。"""
-        args = [
-            "-c",
-            f"http.connectTimeout={GIT_HTTP_CONNECT_TIMEOUT_SEC}",
-        ]
-        if repo_dir is not None:
-            safe_path = str(repo_dir.resolve()).replace("\\", "/")
-            args.extend(["-c", f"safe.directory={safe_path}"])
-        return args
-
     def _get_configured_http_version(self) -> str:
         """从网络配置文件中读取用户设置的 http.version（空字符串表示不强制）。"""
         try:
@@ -1692,90 +1512,38 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
         if not cmd:
             return False, "empty command"
 
-        effective_cmd = list(cmd)
         if cmd[0] == "git":
-            git_exe = self._resolve_git_executable()
-            if not git_exe:
-                return False, "git.exe not found"
             repo_safe = safe_dir if safe_dir is not None else cwd
-            effective_cmd = [git_exe, *self._git_config_prefix(repo_safe), *cmd[1:]]
-        elif cmd[0] == "gh":
-            gh_exe = self._resolve_gh_executable()
-            if not gh_exe:
-                return False, "gh.exe not found"
-            effective_cmd[0] = gh_exe
-
-        self._log(f"$ {' '.join(effective_cmd)}")
-        run_env = os.environ.copy()
-        if cmd[0] == "git":
-            run_env["GIT_HTTP_CONNECT_TIMEOUT"] = str(GIT_HTTP_CONNECT_TIMEOUT_SEC)
-        gh_token = (self.gh_token_edit.text() or "").strip()
-        if gh_token:
-            run_env["GH_TOKEN"] = gh_token
-            run_env["GITHUB_TOKEN"] = gh_token
-        try:
-            proc = subprocess.Popen(
-                effective_cmd,
-                cwd=str(cwd) if cwd else None,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                env=run_env,
+            git_args = cmd[1:]
+            self._log(f"$ git {' '.join(git_args)}")
+            if len(git_args) >= 2 and git_args[0] == "clone":
+                return git_helper.clone_from(
+                    git_args[1],
+                    Path(git_args[2]),
+                    safe_dir=repo_safe,
+                )
+            return git_helper.execute_git(
+                git_args,
+                cwd=cwd,
+                repo_dir=repo_safe,
             )
-            while True:
-                try:
-                    out_b, err_b = proc.communicate(timeout=0.1)
-                    break
-                except subprocess.TimeoutExpired:
-                    scroll = self._list_scroll_pos()
-                    QApplication.processEvents()
-                    self._restore_list_scroll(scroll)
-        except Exception as exc:
-            return False, str(exc)
 
-        def _decode_output(data: bytes | None) -> str:
-            if not data:
-                return ""
-            for enc in ("utf-8", "gbk", sys.getdefaultencoding()):
-                try:
-                    return data.decode(enc)
-                except Exception:
-                    continue
-            return data.decode("utf-8", errors="replace")
-
-        out = _decode_output(out_b).strip()
-        err = _decode_output(err_b).strip()
-        merged = "\n".join(x for x in [out, err] if x)
-        if proc.returncode != 0:
-            return False, merged or f"exit code={proc.returncode}"
-        return True, merged
+        return False, f"unsupported command: {cmd[0]}"
 
     def _check_tools(self) -> bool:
-        ok_git, msg_git = self._run(["git", "--version"])
-        ok_gh, msg_gh = self._run(["gh", "--version"])
+        ok_git, msg_git = git_helper.check_git_available()
         if not ok_git:
             QMessageBox.warning(
                 self,
                 "缺少工具",
                 (
-                    "找不到 git。\n"
-                    "请在顶部 git.exe 输入框设置路径，"
-                    "例如: C:\\Program Files\\Git\\cmd\\git.exe\n\n"
+                    "GitPython 无法调用 git（请确认 Git 已安装且在 PATH 中）。\n\n"
                     f"详细信息:\n{msg_git}"
                 ),
             )
             return False
-        if not ok_gh:
-            QMessageBox.warning(
-                self,
-                "缺少工具",
-                (
-                    "找不到 gh。\n"
-                    "请在顶部 gh.exe 输入框设置路径，"
-                    "例如: C:\\Program Files\\GitHub CLI\\gh.exe\n\n"
-                    f"详细信息:\n{msg_gh}"
-                ),
-            )
-            return False
+        if not self._github_token():
+            self._log("[WARN] 未配置 GitHub Token，远端列表/建仓/删远端等功能将不可用。")
         return True
 
     def _local_package_entries(self) -> list[tuple[str, Path]]:
@@ -1814,46 +1582,10 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
 
     def _fetch_remote_repo_names(self, owner: str) -> tuple[bool, list[str], str]:
         """列出 GitHub owner 下全部仓库名。"""
-        if not self._resolve_gh_executable(from_manual=False):
-            return False, [], "gh.exe not found"
-        ok, msg = self._run(
-            ["gh", "repo", "list", owner, "--limit", "1000", "--json", "name"]
-        )
-        if not ok:
-            return False, [], msg
-        try:
-            data = json.loads(msg or "[]")
-        except json.JSONDecodeError as exc:
-            return False, [], f"解析 gh repo list 失败: {exc}"
-        if not isinstance(data, list):
-            return False, [], "gh repo list 返回格式异常"
-        names = [
-            str(item.get("name", "")).strip()
-            for item in data
-            if isinstance(item, dict) and str(item.get("name", "")).strip()
-        ]
-        return True, names, ""
+        return github_helper.list_repo_names(owner, self._github_token())
 
     def _fetch_remote_repo_names_quiet(self, owner: str) -> tuple[bool, list[str], str]:
-        if not self._resolve_gh_executable(from_manual=False):
-            return False, [], "gh.exe not found"
-        ok, msg = self._run_quiet(
-            ["gh", "repo", "list", owner, "--limit", "1000", "--json", "name"]
-        )
-        if not ok:
-            return False, [], msg
-        try:
-            data = json.loads(msg or "[]")
-        except json.JSONDecodeError as exc:
-            return False, [], f"解析 gh repo list 失败: {exc}"
-        if not isinstance(data, list):
-            return False, [], "gh repo list 返回格式异常"
-        names = [
-            str(item.get("name", "")).strip()
-            for item in data
-            if isinstance(item, dict) and str(item.get("name", "")).strip()
-        ]
-        return True, names, ""
+        return github_helper.list_repo_names(owner, self._github_token())
 
     def _collect_full_package_data(
         self,
@@ -1876,7 +1608,7 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
                 if name in local_names or name in SKIP_DIRS:
                     continue
                 entries.append((name, self._remote_package_path(name), True))
-        elif self._resolve_gh_executable(from_manual=False):
+        elif self._github_token():
             warnings.append(f"[WARN] 获取远端仓库列表失败，仅显示本地包: {err}")
 
         return entries, {}, warnings
@@ -1894,7 +1626,7 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
                 if name in local_names or name in SKIP_DIRS:
                     continue
                 entries.append((name, self._remote_package_path(name), True))
-        elif self._resolve_gh_executable(from_manual=False):
+        elif self._github_token():
             self._log(f"[WARN] 获取远端仓库列表失败，仅显示本地包: {err}")
 
         return entries
@@ -2590,7 +2322,7 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
         # fetch 完成不再输出阶段标题
         if missing:
             self._package_refresh_bridge.log.emit(
-                f"[提示] 以下 {len(missing)} 个包的远端仓库不存在（首次上传时程序会自动 gh repo create）："
+                f"[提示] 以下 {len(missing)} 个包的远端仓库不存在（首次上传时程序会自动创建远端仓库）："
             )
             for n in missing:
                 self._package_refresh_bridge.log.emit(f"  - {n}")
@@ -2600,66 +2332,6 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
             )
             for n in failed:
                 self._package_refresh_bridge.log.emit(f"  - {n}")
-
-    def _scan_sync_counts(
-        self, pkg_dir: Path, git_exe: str, *, fetch_remote: bool = False
-    ) -> dict[str, int]:
-        """对比上游分支，返回 ahead（本地领先）/ behind（远端领先）提交数。"""
-        sync = {"ahead": 0, "behind": 0}
-        prefix = self._git_config_prefix(pkg_dir)
-        run_env = os.environ.copy()
-        run_env["GIT_HTTP_CONNECT_TIMEOUT"] = str(GIT_HTTP_CONNECT_TIMEOUT_SEC)
-        try:
-            if fetch_remote:
-                subprocess.run(
-                    [git_exe, *prefix, "fetch", "--quiet", "--prune"],
-                    cwd=str(pkg_dir),
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    env=run_env,
-                    timeout=GIT_FETCH_TIMEOUT_SEC,
-                    check=False,
-                )
-            proc_up = subprocess.run(
-                [
-                    git_exe,
-                    *prefix,
-                    "rev-parse",
-                    "--abbrev-ref",
-                    "--symbolic-full-name",
-                    "@{u}",
-                ],
-                cwd=str(pkg_dir),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=10,
-                check=False,
-            )
-            if proc_up.returncode != 0 or not (proc_up.stdout or "").strip():
-                return sync
-            proc = subprocess.run(
-                [git_exe, *prefix, "rev-list", "--left-right", "--count", "HEAD...@{u}"],
-                cwd=str(pkg_dir),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=10,
-                check=False,
-            )
-            if proc.returncode != 0:
-                return sync
-            parts = (proc.stdout or "").strip().split()
-            if len(parts) == 2:
-                sync["ahead"] = max(0, int(parts[0]))
-                sync["behind"] = max(0, int(parts[1]))
-        except Exception:
-            pass
-        return sync
 
     def _scan_package_status(
         self, pkg_dir: Path, *, check_remote: bool = True, fetch_remote: bool = False
@@ -3013,7 +2685,7 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
                         if name in local_names or name in SKIP_DIRS:
                             continue
                         entries.append((name, self._remote_package_path(name), True))
-                elif self._resolve_gh_executable(from_manual=False):
+                elif self._github_token():
                     self._package_refresh_bridge.log.emit(f"[WARN] 获取远端仓库列表失败，仅显示本地包: {err}")
 
                 self._package_refresh_bridge.list_ready.emit(token, entries, {}, [])
@@ -3245,19 +2917,12 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
     def _ensure_git_repo(self, pkg_dir: Path) -> bool:
         if (pkg_dir / ".git").is_dir():
             return True
-        repo = self._repo(pkg_dir)
-        if repo is None:
-            try:
-                Repo.init(str(pkg_dir), initial_branch="main")
-            except Exception as exc:
-                self._log(f"[ERR] {pkg_dir.name} git init 失败: {exc}")
-                return False
-        try:
-            repo = self._repo(pkg_dir)
-            if repo is not None:
-                repo.git.config("core.longpaths", "true")
-        except Exception:
-            pass
+        if self._repo(pkg_dir) is not None:
+            return True
+        ok, err = git_helper.init_repo(pkg_dir)
+        if not ok:
+            self._log(f"[ERR] {pkg_dir.name} git init 失败: {err}")
+            return False
         return True
 
     def _ensure_gitignore(self, pkg_dir: Path):
@@ -3291,7 +2956,9 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
             rev_list = repo.git.rev_list("--objects", rev_range)
             if not (rev_list or "").strip():
                 return []
-            cat_out = repo.git.cat_file("--batch-check=%(objecttype) %(objectname) %(objectsize) %(rest)", input=rev_list)
+            cat_ok, cat_out = git_helper.cat_file_batch_check(pkg_dir, rev_list)
+            if not cat_ok:
+                raise RuntimeError(cat_out)
         except Exception as exc:
             self._log(f"[WARN] 扫描大文件失败: {exc}")
             return []
@@ -3355,15 +3022,14 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
     def _try_create_github_repo_and_push(
         self, pkg_dir: Path, pkg_name: str, owner: str, branch: str
     ) -> bool:
-        """远端仓库不存在时：gh repo create 后 push（兼容本地已有 origin）。"""
-        ok_create, msg_create = self._run(
-            ["gh", "repo", "create", f"{owner}/{pkg_name}", "--public"],
-            cwd=pkg_dir,
+        """远端仓库不存在时：GitHub API 建仓后 push（兼容本地已有 origin）。"""
+        ok_create, msg_create = github_helper.create_repo(
+            owner, pkg_name, self._github_token(), public=True
         )
         if not ok_create:
             low = (msg_create or "").lower()
             if "already exists" not in low and "name already exists" not in low:
-                self._log(f"[ERR] {pkg_name} gh repo create 失败: {msg_create}")
+                self._log(f"[ERR] {pkg_name} 创建远端仓库失败: {msg_create}")
                 QMessageBox.warning(
                     self,
                     "上传失败",
@@ -3376,8 +3042,8 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
             remote_url = f"https://github.com/{owner}/{pkg_name}.git"
             self._run(["git", "remote", "add", "origin", remote_url], cwd=pkg_dir)
 
-        ok_push, msg_push = self._run(
-            ["git", "push", "-u", "origin", branch], cwd=pkg_dir
+        ok_push, msg_push = git_helper.push(
+            pkg_dir, branch, set_upstream=True
         )
         if ok_push:
             self._log(f"[ok] {pkg_name} created and pushed")
@@ -3394,7 +3060,7 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
 
     @staticmethod
     def _should_try_create_repo(push_err: str) -> bool:
-        """仅在明显“远端仓库不存在”时才尝试 gh repo create。"""
+        """仅在明显“远端仓库不存在”时才尝试自动创建远端仓库。"""
         low = (push_err or "").lower()
         repo_not_found_markers = [
             "repository not found",
@@ -3421,11 +3087,18 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
             "protected branch",
             "permission denied",
         ]
-        if any(m in low for m in network_markers):
-            return False
-        if any(m in low for m in reject_markers):
+        tooling_markers = [
+            "kill_after_timeout",
+            "not supported on windows",
+        ]
+        if any(m in low for m in tooling_markers + network_markers + reject_markers):
             return False
         return any(m in low for m in repo_not_found_markers)
+
+    @staticmethod
+    def _is_git_tooling_error(err: str) -> bool:
+        low = (err or "").lower()
+        return "kill_after_timeout" in low or "not supported on windows" in low
 
     @staticmethod
     def _is_non_fast_forward_error(push_err: str) -> bool:
@@ -3598,6 +3271,8 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
         can_apply_single_file = bool(file_apply_pkg_dir and upstream_ref)
 
         file_blocks = self._extract_file_diff_blocks(preview)
+        if not file_blocks:
+            file_blocks = self._extract_status_file_blocks(preview)
         for file_name, block in file_blocks:
             # 尝试从 diff block 解析相对路径，用于“单文件合并到本地”
             relpath: str | None = None
@@ -3956,6 +3631,37 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
         return blocks
 
     @staticmethod
+    def _extract_status_file_blocks(lines: list[str]) -> list[tuple[str, str]]:
+        """无 diff 块时，从 status / name-status 行生成按文件展示的标签页内容。"""
+        blocks: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        for line in lines:
+            stripped = line.strip()
+            if not stripped or stripped.startswith("[") or stripped.startswith("("):
+                continue
+            path = stripped
+            if "\t" in stripped:
+                parts = stripped.split("\t", 1)
+                path = parts[1].strip() if len(parts) > 1 else stripped
+            elif stripped.startswith("?? "):
+                path = stripped[3:].strip()
+            elif len(stripped) > 3 and stripped[2] == " ":
+                path = stripped[3:].strip()
+            elif " " in stripped:
+                head, rest = stripped.split(maxsplit=1)
+                if len(head) <= 2 and head.strip():
+                    path = rest.strip()
+            if " -> " in path:
+                path = path.split(" -> ", 1)[-1].strip()
+            path = path.strip().strip('"')
+            if not path or path in seen:
+                continue
+            seen.add(path)
+            name = Path(path.replace("\\", "/")).name or path
+            blocks.append((name, stripped))
+        return blocks[:80]
+
+    @staticmethod
     def _apply_diff_highlight(editor: QTextEdit):
         highlighter = _DiffHighlighter(editor.document())
         setattr(editor, "_diff_highlighter", highlighter)
@@ -4049,11 +3755,76 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
             return False, f"AI 详细分析失败: {exc}"
 
     def _status_lines(self, pkg_dir: Path) -> tuple[bool, list[str]]:
+        repo = self._repo(pkg_dir)
+        if repo is not None:
+            try:
+                out = repo.git.status(porcelain=True)
+                lines = [line for line in (out or "").splitlines() if line.strip()]
+                return True, lines
+            except Exception:
+                pass
         ok, msg = self._run(["git", "status", "--porcelain"], cwd=pkg_dir)
         if not ok:
             return False, [f"[无法获取 status] {msg}"]
         lines = [line for line in (msg or "").splitlines() if line.strip()]
         return True, lines
+
+    def _resolve_compare_ref(self, pkg_dir: Path) -> tuple[str | None, str]:
+        """解析上传对比基准：上游分支或 origin/<当前分支>。"""
+        ok_up, upstream = self._run(
+            ["git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+            cwd=pkg_dir,
+        )
+        if ok_up and (upstream or "").strip():
+            ref = upstream.strip().splitlines()[-1]
+            return ref, f"上游 {ref}"
+
+        branch = self._current_branch(pkg_dir)
+        remote_ref = f"origin/{branch}"
+        ok_ref, _ = self._run(["git", "rev-parse", "--verify", remote_ref], cwd=pkg_dir)
+        if ok_ref:
+            return remote_ref, f"远端 {remote_ref}"
+        return None, "远端尚无对应分支（首次推送）"
+
+    def _append_first_push_preview(self, out: list[str], pkg_dir: Path) -> None:
+        """无远端基准时：展示本地待推送提交与将推送的文件。"""
+        ok_log, msg_log = self._run(["git", "log", "--oneline", "-20"], cwd=pkg_dir)
+        out.append("")
+        out.append("[本地待推送提交]")
+        log_lines = [line for line in (msg_log or "").splitlines() if line.strip()]
+        out.extend(log_lines or ["(无提交记录 — 仅会推送未提交的工作区改动)"])
+
+        empty_tree = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+        out.append("")
+        out.append("[将推送的文件列表 name-status]")
+        ok_ns, msg_ns = self._run(
+            ["git", "diff", "--name-status", empty_tree, "HEAD"], cwd=pkg_dir
+        )
+        if ok_ns and (msg_ns or "").strip():
+            out.extend(msg_ns.strip().splitlines())
+        else:
+            ok_tree, msg_tree = self._run(
+                ["git", "ls-tree", "-r", "--name-only", "HEAD"], cwd=pkg_dir
+            )
+            tree_lines = [line for line in (msg_tree or "").splitlines() if line.strip()]
+            out.extend(tree_lines or ["(HEAD 中无已跟踪文件)"])
+
+        out.append("")
+        ok_stat, msg_stat = self._run(
+            ["git", "diff", "--stat", empty_tree, "HEAD"], cwd=pkg_dir
+        )
+        if ok_stat and (msg_stat or "").strip():
+            out.append("[将推送的变更统计]")
+            out.extend(msg_stat.strip().splitlines())
+            out.append("")
+
+        out.extend(
+            self._diff_lines(
+                pkg_dir,
+                ["git", "diff", "--patch", empty_tree, "HEAD"],
+                "将推送到远端的完整 diff",
+            )
+        )
 
     def _diff_lines(self, pkg_dir: Path, diff_cmd: list[str], title: str) -> list[str]:
         ok, msg = self._run(diff_cmd, cwd=pkg_dir)
@@ -4067,39 +3838,41 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
     def _preview_upload_files(self, pkg_dir: Path) -> list[str]:
         """上传确认显示远端差异，并补充本地未提交改动提示。"""
         self._run(["git", "fetch", "--all", "--prune"], cwd=pkg_dir)
-        ok_up, upstream = self._run(
-            ["git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"], cwd=pkg_dir
-        )
+        compare_ref, compare_desc = self._resolve_compare_ref(pkg_dir)
         out: list[str] = []
         ok_status, status_lines = self._status_lines(pkg_dir)
 
-        if not ok_up or not upstream.strip():
-            out.append("[远端差异预览] 无上游分支，推送时将按当前分支创建/关联远端。")
-            self._append_local_pending_preview(out, pkg_dir, ok_status, status_lines)
-            return out
-
-        upstream_ref = upstream.strip().splitlines()[-1]
-        out.extend([f"[远端差异预览] 本地 HEAD -> 远端 {upstream_ref}", "", "[文件列表: name-status]"])
-
-        ok_name, msg_name = self._run(
-            ["git", "diff", "--name-status", f"{upstream_ref}..HEAD"], cwd=pkg_dir
-        )
-        if not ok_name:
-            out.append(f"[远端差异预览] 获取失败: {msg_name}")
-            self._append_local_pending_preview(out, pkg_dir, ok_status, status_lines)
-            return out
-
-        lines = [line for line in (msg_name or "").splitlines() if line.strip()]
-        out.extend(lines or ["(当前无已提交差异可推送)"])
-        out.append("")
-        out.extend(
-            self._diff_lines(
-                pkg_dir,
-                ["git", "diff", "--patch", f"{upstream_ref}..HEAD"],
-                "将推送到远端的提交差异 diff",
+        if compare_ref:
+            out.extend(
+                [f"[远端差异预览] 本地 HEAD 相对 {compare_desc}", "", "[文件列表: name-status]"]
             )
-        )
+            ok_name, msg_name = self._run(
+                ["git", "diff", "--name-status", f"{compare_ref}..HEAD"], cwd=pkg_dir
+            )
+            if not ok_name:
+                out.append(f"[远端差异预览] 获取失败: {msg_name}")
+            else:
+                lines = [line for line in (msg_name or "").splitlines() if line.strip()]
+                out.extend(lines or ["(当前无已提交差异可推送)"])
+            out.append("")
+            out.extend(
+                self._diff_lines(
+                    pkg_dir,
+                    ["git", "diff", "--patch", f"{compare_ref}..HEAD"],
+                    "将推送到远端的提交差异 diff",
+                )
+            )
+        else:
+            out.append(f"[远端差异预览] {compare_desc}。")
+            self._append_first_push_preview(out, pkg_dir)
+
         self._append_local_pending_preview(out, pkg_dir, ok_status, status_lines)
+        if ok_status and status_lines:
+            out.append("")
+            out.append("[工作区文件一览 status]")
+            out.extend(
+                self._format_status_lines_with_full_path(pkg_dir, status_lines)
+            )
         return out
 
     def _preview_package_list_progress(self, package_entries: list[tuple[str, Path, bool]], ready: set[str]):
@@ -4324,13 +4097,17 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
                     commit_msg = manual_msg
                     self._log(f"[info] {pkg_name} 使用手动提交注释")
                 if ai_commit_msg:
-                    self._log(f"[ok] {pkg_name} 使用 AI 生成提交注释")
+                    ai_provider = (self._ai_config or {}).get("provider", "?")
+                    ai_model = (self._ai_config or {}).get("model", "?")
+                    self._log(f"[ok] {pkg_name} 使用 AI 生成提交注释 (provider={ai_provider}, model={ai_model})")
                 commit_msg = commit_msg or ""
-                ok_commit, msg_commit = self._run(
-                    ["git", "commit", "-m", commit_msg], cwd=pkg_dir
-                )
+                ok_commit, msg_commit, commit_hash = git_helper.commit(pkg_dir, commit_msg)
                 if not ok_commit:
                     self._log(f"[WARN] {pkg_name} commit 失败: {msg_commit}")
+                elif commit_hash:
+                    self._log(f"[ok] {pkg_name} committed: {commit_hash}")
+                else:
+                    self._log(f"[info] {pkg_name} no changes to commit")
             else:
                 self._log(f"[info] {pkg_name} no changes to commit")
 
@@ -4349,8 +4126,7 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
                 self._confirm_push_with_oversized_files(pkg_name, oversized)
                 return
 
-            push_cmd = ["git", "push", "-u", "origin", branch]
-            ok_push, msg_push = self._run(push_cmd, cwd=pkg_dir)
+            ok_push, msg_push = git_helper.push(pkg_dir, branch, set_upstream=True)
             if ok_push:
                 self._log(f"[ok] {pkg_name} pushed")
                 self._log_upload_summary(pkg_dir, pkg_name)
@@ -4367,9 +4143,10 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
                         )
                         self._confirm_push_with_oversized_files(pkg_name, oversized)
                         return
-                    force_cmd = push_cmd + ["--force-with-lease"]
                     self._log(f"[warn] {pkg_name} 用户确认强制覆盖远端")
-                    ok_force, msg_force = self._run(force_cmd, cwd=pkg_dir)
+                    ok_force, msg_force = git_helper.push(
+                        pkg_dir, branch, set_upstream=True, force_with_lease=True
+                    )
                     if ok_force:
                         self._log(f"[ok] {pkg_name} 强制推送成功")
                         self._log_upload_summary(pkg_dir, pkg_name)
@@ -4385,28 +4162,34 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
                 return
 
             if not self._should_try_create_repo(msg_push):
-                self._log(f"[ERR] {pkg_name} push 失败（不满足自动建仓条件）: {msg_push}")
+                self._log(f"[ERR] {pkg_name} push 失败: {msg_push}")
+                hint = ""
+                if self._is_git_tooling_error(msg_push):
+                    hint = (
+                        "（Git 命令在 Windows 下执行异常，请更新本工具后重试；"
+                        "若仍失败请检查 Git 是否在 PATH 中。）\n\n"
+                    )
+                elif "repository not found" not in (msg_push or "").lower():
+                    hint = (
+                        "远端仓库可能已存在。请检查：网络、GitHub 登录/Token、"
+                        "分支是否冲突、是否有未推送的本地提交。\n\n"
+                    )
                 QMessageBox.warning(
                     self,
                     "上传失败",
-                    (
-                        f"{pkg_name} push 失败。\n\n"
-                        "本次错误不是“仓库不存在”，已跳过自动 gh repo create。\n"
-                        "请检查网络/远端状态后重试。\n\n"
-                        f"详情:\n{msg_push}"
-                    ),
+                    f"{pkg_name} push 失败。\n\n{hint}详情:\n{msg_push}",
                 )
                 return
 
-            self._log(f"[info] push 失败，检测为仓库不存在，尝试 gh repo create: {msg_push}")
-            if not self._resolve_gh_executable():
-                self._log("[ERR] 未找到 gh.exe，无法自动创建远端仓库")
+            self._log(f"[info] push 失败，检测为仓库不存在，尝试创建远端仓库: {msg_push}")
+            if not self._github_token():
+                self._log("[ERR] 未配置 GitHub Token，无法自动创建远端仓库")
                 QMessageBox.warning(
                     self,
                     "上传失败",
                     (
-                        f"{pkg_name} push 失败，且未找到 gh.exe。\n"
-                        "请在顶部 gh.exe 输入框设置 gh 路径后重试。"
+                        f"{pkg_name} push 失败，且未配置 GitHub Token。\n"
+                        "请点击「网页登录授权」或手动填写 Token 后重试。"
                     ),
                 )
                 return
@@ -4551,7 +4334,7 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
         self._set_busy(True)
         try:
             self._log(f"========== 删除远端 {pkg_name} ==========")
-            ok, msg = self._run(["gh", "repo", "delete", f"{owner}/{pkg_name}", "--yes"])
+            ok, msg = github_helper.delete_repo(owner, pkg_name, self._github_token())
             if ok:
                 self._log(f"[ok] {pkg_name} 远端仓库已删除: {owner}/{pkg_name}")
             else:

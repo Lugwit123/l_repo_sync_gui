@@ -128,6 +128,9 @@
         </property>
         <item>
          <widget class="QLabel" name="lbl_git">
+          <property name="visible">
+           <bool>false</bool>
+          </property>
           <property name="text">
            <string>git.exe:</string>
           </property>
@@ -135,6 +138,9 @@
         </item>
         <item>
          <widget class="QLineEdit" name="git_path_edit">
+          <property name="visible">
+           <bool>false</bool>
+          </property>
           <property name="placeholderText">
            <string>git.exe path (optional, auto-detect if empty)</string>
           </property>
@@ -142,6 +148,9 @@
         </item>
         <item>
          <widget class="QLabel" name="lbl_gh">
+          <property name="visible">
+           <bool>false</bool>
+          </property>
           <property name="text">
            <string>gh.exe:</string>
           </property>
@@ -149,6 +158,9 @@
         </item>
         <item>
          <widget class="QLineEdit" name="gh_path_edit">
+          <property name="visible">
+           <bool>false</bool>
+          </property>
           <property name="placeholderText">
            <string>gh.exe path (optional, auto-detect if empty)</string>
           </property>
