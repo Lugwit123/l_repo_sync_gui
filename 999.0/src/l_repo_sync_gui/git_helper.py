@@ -9,7 +9,6 @@ import sys
 from pathlib import Path
 
 from git import Git, Repo
-from git.config import GitConfigParser
 from git.exc import GitCommandError, GitCommandNotFound, InvalidGitRepositoryError
 
 GIT_HTTP_CONNECT_TIMEOUT_SEC = 5
@@ -180,45 +179,31 @@ def init_repo(pkg_dir: Path, branch: str = "main") -> tuple[bool, str]:
 # ---- 全局 git config（~/.gitconfig）----
 
 
-def _global_config() -> GitConfigParser:
-    return GitConfigParser(read_only=False)
-
-
 def global_config_get(key: str) -> str | None:
-    """key 形如 http.proxy、https.proxy、http.version。"""
-    parts = key.split(".", 1)
-    if len(parts) != 2:
+    """读取全局 git config；key 形如 http.proxy、https.proxy、http.version。
+
+    避免直接创建 GitConfigParser。部分 GitPython 版本在 Python 3.12 下，
+    GitConfigParser 初始化失败后析构会触发 `_read_only` AttributeError。
+    """
+    ok, out = execute_git(["config", "--global", "--get", key], timeout=30)
+    if not ok:
         return None
-    section, name = parts
-    cfg = _global_config()
-    try:
-        val = cfg.get_value("global", section, name)
-        return str(val).strip() if val else None
-    except Exception:
-        return None
+    val = (out or "").strip()
+    return val or None
 
 
 def global_config_set(key: str, value: str) -> None:
-    parts = key.split(".", 1)
-    if len(parts) != 2:
+    """写入全局 git config，使用 git config 命令规避 GitConfigParser 析构异常。"""
+    if "." not in (key or ""):
         return
-    section, name = parts
-    cfg = _global_config()
-    cfg.set_value("global", section, None, name, value)
-    cfg.write()
+    execute_git(["config", "--global", key, value or ""], timeout=30)
 
 
 def global_config_unset(key: str) -> None:
-    parts = key.split(".", 1)
-    if len(parts) != 2:
+    """删除全局 git config；不存在时忽略。"""
+    if "." not in (key or ""):
         return
-    section, name = parts
-    cfg = _global_config()
-    try:
-        cfg.remove_option("global", section, name)
-        cfg.write()
-    except Exception:
-        pass
+    execute_git(["config", "--global", "--unset-all", key], timeout=30)
 
 
 def apply_global_proxy(http_proxy: str | None, https_proxy: str | None) -> None:

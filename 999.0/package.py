@@ -17,6 +17,8 @@ requires = [
 def commands():
     env.PYTHONPATH.prepend("{root}/src")
     alias("l_repo_sync_gui", "python {root}/src/l_repo_sync_gui/main.py")
+    alias("l_repo_sync_gui_refresh", "python {root}/src/l_repo_sync_gui/main.py --refresh-status")
+
 
 
 build_command = False

@@ -6,7 +6,7 @@
    <rect>
     <x>0</x>
     <y>0</y>
-    <width>797</width>
+    <width>1134</width>
     <height>680</height>
    </rect>
   </property>
@@ -78,6 +78,67 @@
           </property>
           <property name="placeholderText">
            <string>GitHub owner, e.g. Lugwit123</string>
+          </property>
+         </widget>
+        </item>
+        <item>
+         <widget class="QCheckBox" name="debug_start_pkg">
+          <property name="text">
+           <string>启动包时debug</string>
+          </property>
+         </widget>
+        </item>
+        <item>
+         <widget class="QCheckBox" name="solo_checkBox">
+          <property name="text">
+           <string>.solo</string>
+          </property>
+         </widget>
+        </item>
+        <item>
+         <widget class="Line" name="line">
+          <property name="orientation">
+           <enum>Qt::Vertical</enum>
+          </property>
+         </widget>
+        </item>
+        <item>
+         <widget class="QRadioButton" name="radioButton">
+          <property name="text">
+           <string>none</string>
+          </property>
+          <property name="checked">
+           <bool>true</bool>
+          </property>
+          <attribute name="buttonGroup">
+           <string notr="true">run_buttonGroup</string>
+          </attribute>
+         </widget>
+        </item>
+        <item>
+         <widget class="QRadioButton" name="radioButton_2">
+          <property name="text">
+           <string>cmd</string>
+          </property>
+          <attribute name="buttonGroup">
+           <string notr="true">run_buttonGroup</string>
+          </attribute>
+         </widget>
+        </item>
+        <item>
+         <widget class="QRadioButton" name="radioButton_3">
+          <property name="text">
+           <string>ps</string>
+          </property>
+          <attribute name="buttonGroup">
+           <string notr="true">run_buttonGroup</string>
+          </attribute>
+         </widget>
+        </item>
+        <item>
+         <widget class="Line" name="line_2">
+          <property name="orientation">
+           <enum>Qt::Vertical</enum>
           </property>
          </widget>
         </item>
@@ -307,8 +368,8 @@
             <rect>
              <x>0</x>
              <y>0</y>
-             <width>266</width>
-             <height>137</height>
+             <width>437</width>
+             <height>144</height>
             </rect>
            </property>
            <layout class="QVBoxLayout" name="list_layout">
@@ -397,11 +458,11 @@
          </property>
          <item>
           <widget class="QPushButton" name="btn_model_settings">
-           <property name="text">
-            <string>模型设置…</string>
-           </property>
            <property name="toolTip">
             <string>配置 AI 提供商、Base URL、API Key、模型等</string>
+           </property>
+           <property name="text">
+            <string>模型设置…</string>
            </property>
           </widget>
          </item>
@@ -414,11 +475,11 @@
          </item>
          <item>
           <widget class="QComboBox" name="model_edit">
-           <property name="editable">
-            <bool>false</bool>
-           </property>
            <property name="toolTip">
             <string>当前使用的模型（在“模型设置…”中修改）</string>
+           </property>
+           <property name="editable">
+            <bool>false</bool>
            </property>
           </widget>
          </item>
@@ -486,4 +547,7 @@
  </widget>
  <resources/>
  <connections/>
+ <buttongroups>
+  <buttongroup name="run_buttonGroup"/>
+ </buttongroups>
 </ui>

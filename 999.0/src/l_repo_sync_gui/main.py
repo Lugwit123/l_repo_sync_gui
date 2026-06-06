@@ -1,4 +1,5 @@
 import argparse
+import ast
 import concurrent.futures
 import ctypes
 import datetime
@@ -6,6 +7,8 @@ import difflib
 import json
 import logging
 import os
+import re
+import shlex
 import shutil
 import socket
 import subprocess
@@ -28,10 +31,11 @@ from pathlib import Path
 
 from PySide6.QtCore import QFile, QObject, Qt, QTimer, Signal
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
-from PySide6.QtGui import QColor, QIcon, QSyntaxHighlighter, QTextCharFormat
+from PySide6.QtGui import QAction, QColor, QIcon, QSyntaxHighlighter, QTextCharFormat
 from PySide6.QtUiTools import QUiLoader
 from PySide6.QtWidgets import (
     QApplication,
+    QButtonGroup,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -44,6 +48,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QProgressBar,
     QPushButton,
@@ -207,6 +212,44 @@ def _set_windows_app_id():
         pass
 
 
+def parse_rez_package_aliases(package_text: str) -> list[tuple[str, str]]:
+    """从 Rez package.py 文本中解析 alias(name, command)。
+
+    返回 [(alias_name, alias_command), ...]，只接受静态字符串字面量，避免执行 package.py。
+    """
+    aliases: list[tuple[str, str]] = []
+    try:
+        tree = ast.parse(package_text)
+    except SyntaxError:
+        return aliases
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        is_alias = isinstance(func, ast.Name) and func.id == "alias"
+        if not is_alias or len(node.args) < 2:
+            continue
+        try:
+            alias_name = ast.literal_eval(node.args[0])
+            alias_command = ast.literal_eval(node.args[1])
+        except Exception:
+            continue
+        if isinstance(alias_name, str) and isinstance(alias_command, str):
+            aliases.append((alias_name, alias_command))
+    return aliases
+
+
+def format_rez_alias_launch_cmd(
+    pkg_name: str,
+    alias_name: str,
+    *,
+    wuwo_bat: Path | None = None,
+) -> str:
+    if wuwo_bat is not None:
+        return f"wuwor {pkg_name} .ps .solo -- {alias_name}"
+    return f"wuwo {pkg_name} .ps .solo -- {alias_name}"
+
+
 class _AiBridge(QObject):
     finished = Signal(bool, str)
 
@@ -216,7 +259,7 @@ class _NetTestBridge(QObject):
 
 
 class _PackageRefreshBridge(QObject):
-    list_ready = Signal(int, list, object, list)
+    list_ready = Signal(int, list, object, list, bool)
     status_ready = Signal(int, object)
     failed = Signal(int, str)
     one_ready = Signal(str, bool, object, object, str)
@@ -259,13 +302,22 @@ class _DiffHighlighter(QSyntaxHighlighter):
 
 
 class RepoSyncWindow(TrayAwareMixin, QMainWindow):
-    def __init__(self, launch_mode: str | None = None):
+    def __init__(
+        self,
+        launch_mode: str | None = None,
+        *,
+        refresh_status_on_start: bool = False,
+        launch_command: str | None = None,
+    ):
         super().__init__()
         self.rez_source = _find_rez_source_root()
-        title = "Rez Package Repo Sync"
+        self._refresh_status_on_start = refresh_status_on_start
+        title_parts = ["Rez Package Repo Sync"]
         if launch_mode:
-            title = f"{title} - {launch_mode}"
-        self.setWindowTitle(title)
+            title_parts.append(launch_mode)
+        if launch_command:
+            title_parts.append(launch_command)
+        self.setWindowTitle(" - ".join(title_parts))
         self.resize(1280, 820)
         self.setMinimumSize(1100, 700)
         if APP_ICON_FILE.exists():
@@ -281,8 +333,11 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
         self.btn_refresh_status: QPushButton | None = None
         self.btn_refresh_packages: QPushButton | None = None
         self.ai_ask_btn: QPushButton | None = None
+        self.debug_start_pkg: QCheckBox | None = None
         self._package_refresh_token = 0
         self._package_refresh_running = False
+        self._last_list_scan_status = True
+        self._package_alias_cache: dict[str, list[str]] = {}
         self._package_refresh_bridge = _PackageRefreshBridge()
         self._package_refresh_bridge.list_ready.connect(self._on_package_list_ready)
         self._package_refresh_bridge.status_ready.connect(self._on_package_status_ready)
@@ -296,7 +351,10 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
         self._load_ui()
         self._log_file_handler = None
         self._init_log_file()
-        QTimer.singleShot(0, self._start_package_list_refresh)
+        QTimer.singleShot(
+            0,
+            lambda: self._start_package_list_refresh(scan_status=self._refresh_status_on_start),
+        )
 
     def _load_style(self):
         qss_path = RESOURCES_DIR / "style.qss"
@@ -345,6 +403,9 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
         self.ai_answer_edit = central.findChild(QTextEdit, "ai_answer_edit")
         log_placeholder = central.findChild(QTextEdit, "log_edit")
         self.list_area = central.findChild(QScrollArea, "list_area")
+        self.debug_start_pkg = central.findChild(QCheckBox, "debug_start_pkg")
+        self.run_buttonGroup = central.findChild(QButtonGroup, "run_buttonGroup")
+        self.solo_checkBox = central.findChild(QCheckBox, "solo_checkBox")
 
         # ---- 日志组件替换为 CodeEditorWidget（带行号 + 日志语法高亮）----
         parent_container = log_placeholder.parentWidget()
@@ -2627,7 +2688,7 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
 
     def refresh_package_status(self):
         if not self.package_entries:
-            self._start_package_list_refresh()
+            self._start_package_list_refresh(scan_status=True)
             return
         if self._package_refresh_running:
             return
@@ -2638,6 +2699,7 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
             return
         self._package_refresh_token += 1
         token = self._package_refresh_token
+        self._last_list_scan_status = True
         self._set_package_refresh_busy(True)
         self._log_phase_start("刷新包状态")
 
@@ -2658,9 +2720,9 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
         threading.Thread(target=_worker, daemon=True).start()
 
     def refresh_packages(self):
-        self._start_package_list_refresh()
+        self._start_package_list_refresh(scan_status=True)
 
-    def _start_package_list_refresh(self):
+    def _start_package_list_refresh(self, *, scan_status: bool = True):
         if self._package_refresh_running:
             return
         self._package_refresh_token += 1
@@ -2677,18 +2739,23 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
                 local_names = {name for name, _ in local}
                 entries: list[tuple[str, Path, bool]] = [(name, path, False) for name, path in local]
 
-                self._package_refresh_bridge.log.emit("获取远端仓库列表…")
-                ok, remote_names, err = self._fetch_remote_repo_names_quiet(owner)
-                if ok:
-                    self._package_refresh_bridge.log.emit(f"远端仓库数: {len(remote_names)}")
-                    for name in sorted(set(remote_names), key=str.lower):
-                        if name in local_names or name in SKIP_DIRS:
-                            continue
-                        entries.append((name, self._remote_package_path(name), True))
-                elif self._github_token():
-                    self._package_refresh_bridge.log.emit(f"[WARN] 获取远端仓库列表失败，仅显示本地包: {err}")
+                if scan_status:
+                    self._package_refresh_bridge.log.emit("获取远端仓库列表…")
+                    ok, remote_names, err = self._fetch_remote_repo_names_quiet(owner)
+                    if ok:
+                        self._package_refresh_bridge.log.emit(f"远端仓库数: {len(remote_names)}")
+                        for name in sorted(set(remote_names), key=str.lower):
+                            if name in local_names or name in SKIP_DIRS:
+                                continue
+                            entries.append((name, self._remote_package_path(name), True))
+                    elif self._github_token():
+                        self._package_refresh_bridge.log.emit(f"[WARN] 获取远端仓库列表失败，仅显示本地包: {err}")
 
-                self._package_refresh_bridge.list_ready.emit(token, entries, {}, [])
+                self._package_refresh_bridge.list_ready.emit(token, entries, {}, [], scan_status)
+
+                if not scan_status:
+                    self._package_refresh_bridge.status_ready.emit(token, {})
+                    return
 
                 scannable = [(name, path) for name, path, remote_only in entries if not remote_only]
                 if scannable:
@@ -2715,19 +2782,26 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
         package_entries: list,
         status_map: dict,
         warnings: list,
+        scan_status: bool = True,
     ):
         if token != self._package_refresh_token:
             return
-        self._render_package_list(package_entries, status_map, loading=True)
+        self._last_list_scan_status = scan_status
+        self._render_package_list(package_entries, status_map, loading=scan_status)
         for line in warnings:
             self._log(line)
         local_count = sum(1 for _, _, remote_only in package_entries if not remote_only)
         remote_count = len(package_entries) - local_count
-        if remote_count:
-            self._log(f"已渲染 {local_count} 个本地包、{remote_count} 个仅远端仓库，开始扫描。")
+        if scan_status:
+            if remote_count:
+                self._log(f"已渲染 {local_count} 个本地包、{remote_count} 个仅远端仓库，开始扫描。")
+            else:
+                self._log(f"已渲染 {local_count} 个包，开始扫描。")
+            self._set_package_refresh_busy(True)
+        elif remote_count:
+            self._log(f"已渲染 {local_count} 个本地包、{remote_count} 个仅远端仓库。")
         else:
-            self._log(f"已渲染 {local_count} 个包，开始扫描。")
-        self._set_package_refresh_busy(True)
+            self._log(f"已渲染 {local_count} 个包。")
 
     def _on_package_status_ready(self, token: int, status_map: dict):
         if token != self._package_refresh_token:
@@ -2735,8 +2809,9 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
         scroll = self._list_scroll_pos()
         self._apply_package_status_map(status_map)
         self._restore_list_scroll(scroll)
-        self._log("已全部刷新")
-        self._log_phase_end("刷新包状态")
+        if self._last_list_scan_status:
+            self._log("已全部刷新")
+            self._log_phase_end("刷新包状态")
         self._log_phase_end("加载包列表")
         self._set_package_refresh_busy(False)
         self._update_merge_buttons()
@@ -2749,6 +2824,232 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
         self._log_phase_end("加载包列表", ok=False)
         self._log_phase_end("刷新包状态", ok=False)
         self._set_package_refresh_busy(False)
+
+    def _wuwo_bat_path(self) -> Path | None:
+        wuwo_bat = self.rez_source.parent / "wuwo" / "wuwo.bat"
+        return wuwo_bat if wuwo_bat.is_file() else None
+
+    def _read_package_aliases(self, pkg_name: str, pkg_dir: Path) -> list[tuple[str, str]]:
+        if pkg_name in self._package_alias_cache:
+            aliases = self._package_alias_cache[pkg_name]
+            self._log(f"[alias] {pkg_name}: 使用缓存，别名数={len(aliases)}")
+            return aliases
+        aliases: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        if pkg_dir.is_dir():
+            if pkg_name == "wuwo":
+                # wuwo 目录里包含 Python/Rez 运行环境，不能全量 rglob，否则会扫到 site-packages 里的测试包。
+                search_roots = [pkg_dir / "packages"]
+            else:
+                # rez-package-source/<pkg>/<version>/package.py，只扫描直接版本目录。
+                search_roots = [pkg_dir]
+            package_files: list[Path] = []
+            for search_root in search_roots:
+                if not search_root.is_dir():
+                    continue
+                package_files.extend(search_root.glob("*/package.py"))
+            package_files = sorted(set(package_files), reverse=True)
+            roots_text = ", ".join(str(p) for p in search_roots)
+            self._log(f"[alias] {pkg_name}: 扫描 package.py 数={len(package_files)} roots={roots_text}")
+            for package_py in package_files:
+                try:
+                    text = package_py.read_text(encoding="utf-8", errors="ignore")
+                except OSError as exc:
+                    self._log(f"[alias][WARN] {pkg_name}: 读取失败 {package_py}: {exc}")
+                    continue
+                parsed_aliases = parse_rez_package_aliases(text)
+                rel_path = package_py
+                try:
+                    rel_path = package_py.relative_to(pkg_dir)
+                except ValueError:
+                    pass
+                self._log(f"[alias] {pkg_name}: {rel_path} 解析到 {len(parsed_aliases)} 个 alias")
+                for alias_name, alias_command in parsed_aliases:
+                    if alias_name not in seen:
+                        aliases.append((alias_name, alias_command))
+                        seen.add(alias_name)
+                        self._log(f"[alias] {pkg_name}: {alias_name} => {alias_command}")
+                    else:
+                        self._log(f"[alias] {pkg_name}: 跳过重复别名 {alias_name}")
+        else:
+            self._log(f"[alias][WARN] {pkg_name}: 包目录不存在 {pkg_dir}")
+        self._package_alias_cache[pkg_name] = aliases
+        self._log(f"[alias] {pkg_name}: 最终别名数={len(aliases)}")
+        return aliases
+
+    def _format_rez_launch_cmd(self, pkg_name: str, alias_name: str) -> str:
+        return format_rez_alias_launch_cmd(
+            pkg_name,
+            alias_name,
+            wuwo_bat=self._wuwo_bat_path(),
+        )
+
+    def _copy_package_launch_cmd(self, pkg_name: str, alias_name: str, alias_command: str):
+        cmd = self._format_rez_launch_cmd(pkg_name, alias_name)
+        copy_text = f"{cmd}  # {{{alias_command}}}"
+        QApplication.clipboard().setText(copy_text)
+        self._log(f"[copy] {copy_text}")
+
+    def _build_clean_env(self) -> dict:
+        """清理 rez 脏环境变量，避免传递给子进程时污染。"""
+        dirty_keys = [
+            "PYTHONHOME", "PYTHONPATH", "PYTHONEXECUTABLE",
+            "__PYVENV_LAUNCHER__",
+            "CONDA_PREFIX", "CONDA_DEFAULT_ENV", "CONDA_EXE",
+            "CONDA_PYTHON_EXE", "CONDA_SHLVL", "_CE_CONDA", "_CE_M",
+            "REZ_USED", "REZ_USED_REQUEST", "REZ_USED_RESOLVE",
+            "REZ_RXT_FILE", "REZ_ENV_PROMPT",
+            "REZ_CONFIG_FILE", "REZ_PACKAGES_PATH",
+        ]
+        env = os.environ.copy()
+        for key in dirty_keys:
+            env.pop(key, None)
+        return env
+
+    def _launch_package_alias(self, pkg_name: str, alias_name: str, alias_command: str):
+        wuwo_bat = self._wuwo_bat_path()
+        if wuwo_bat is None:
+            QMessageBox.warning(self, "启动失败", "未找到 wuwo.bat，无法启动。")
+            return
+        cmd_text = self._format_rez_launch_cmd(pkg_name, alias_name)
+        self._log(f"[launch] {cmd_text}  # {{{alias_command}}}")
+        clean_env = self._build_clean_env()
+
+        # 读取 run_buttonGroup 选择：none / cmd / ps
+        run_mode = "none"
+        if self.run_buttonGroup:
+            checked = self.run_buttonGroup.checkedButton()
+            if checked:
+                run_mode = checked.text().lower()
+        self._log(f"[run_mode] {run_mode}")
+
+        try:
+            # wuwor.bat 是同目录下的转发器，和托盘 Tray.py 完全一致的启动方式
+            wuwo_dir = str(wuwo_bat.parent)
+            wuwor_bat = os.path.join(wuwo_dir, "wuwor.bat")
+            solo = " .solo" if (self.solo_checkBox and self.solo_checkBox.isChecked()) else ""
+            if sys.platform == "win32":
+                if run_mode == "none":
+                    # 当前进程运行，不打开新窗口
+                    final_cmd = f'"{wuwor_bat}" {pkg_name}{solo} -- {alias_name}'
+                elif run_mode == "ps":
+                    # 新 PowerShell 窗口
+                    final_cmd = f'cmd.exe /c start "{pkg_name}" "{wuwor_bat}" {pkg_name} .ps{solo} -- {alias_name}'
+                else:
+                    # cmd: 新 cmd 窗口
+                    final_cmd = f'cmd.exe /c "{wuwor_bat}" {pkg_name} .cmd{solo} -- {alias_name}'
+                self._log(f"[exec] {final_cmd}")
+                self._log(f"[启动包时间] {datetime.datetime.now()}")
+                debug = self.debug_start_pkg.isChecked() if self.debug_start_pkg else False
+                if debug:
+                    # debug 模式：当前进程运行，不创建新控制台
+                    subprocess.Popen(
+                        final_cmd,
+                        shell=True,
+                        cwd=wuwo_dir,
+                        env=clean_env,
+                    )
+                else:
+                    # 正常模式：创建新控制台窗口
+                    subprocess.Popen(
+                        final_cmd,
+                        shell=True,
+                        cwd=wuwo_dir,
+                        env=clean_env,
+                        creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0x00000010),
+                    )
+
+                # 始终从 wuwo_rez.log 读取日志显示到面板
+                import threading
+                log_dir = clean_env.get("LOG_DIR", r"D:\Temp\Log\rez_pkg_log")
+                log_file = os.path.join(log_dir, "wuwo_rez.log")
+
+                def _read_wuwo_log(lf, name):
+                    # 等待日志文件生成（wuwo_rez.py 重写模式）
+                    for _ in range(20):
+                        if os.path.isfile(lf):
+                            break
+                        import time as _t
+                        _t.sleep(0.2)
+                    else:
+                        self._log(f"[{name}] log file not found: {lf}")
+                        return
+                    # 读取并显示
+                    prev = ""
+                    for _ in range(60):  # 最多读 12s
+                        try:
+                            content = open(lf, "r", encoding="utf-8").read()
+                            if content != prev:
+                                new_lines = content[len(prev):]
+                                for line in new_lines.strip().splitlines():
+                                    if line:
+                                        self._log(f"[{name}] {line}")
+                                prev = content
+                        except Exception:
+                            pass
+                        import time as _t
+                        _t.sleep(0.2)
+                    # 最终再读一次确保完整
+                    try:
+                        content = open(lf, "r", encoding="utf-8").read()
+                        if content != prev:
+                            for line in content[len(prev):].strip().splitlines():
+                                if line:
+                                    self._log(f"[{name}] {line}")
+                    except Exception:
+                        pass
+
+                threading.Thread(
+                    target=_read_wuwo_log, args=(log_file, pkg_name), daemon=True
+                ).start()
+            else:
+                inner = f"wuwor {pkg_name} .ps{solo} -- {alias_name}"
+                final_args = ["bash", "-lc", inner]
+                self._log(f"[exec] {' '.join(final_args)}")
+                subprocess.Popen(final_args, cwd=wuwo_dir, env=clean_env)
+        except Exception as exc:
+            QMessageBox.warning(self, "启动失败", str(exc))
+
+    def _show_package_row_context_menu(
+        self,
+        pkg_name: str,
+        pkg_dir: Path,
+        remote_only: bool,
+        global_pos,
+    ):
+        menu = QMenu(self)
+        if remote_only or not pkg_dir.is_dir():
+            action = menu.addAction("（仅远端，本地无 package.py）")
+            action.setEnabled(False)
+            menu.exec(global_pos)
+            return
+
+        aliases = self._read_package_aliases(pkg_name, pkg_dir)
+        self._log(f"[alias-menu] {pkg_name}: 打开右键菜单，别名数={len(aliases)}")
+        if not aliases:
+            action = menu.addAction("（未定义命令别名）")
+            action.setEnabled(False)
+            menu.exec(global_pos)
+            return
+
+        for alias_name, alias_command in aliases:
+            launch_cmd = self._format_rez_launch_cmd(pkg_name, alias_name)
+            menu_text = f"{launch_cmd}  # {{{alias_command}}}"
+            launch_action = QAction(f"启动: {menu_text}", self)
+            launch_action.setToolTip(menu_text)
+            launch_action.triggered.connect(
+                lambda _=False, p=pkg_name, a=alias_name, c=alias_command: self._launch_package_alias(p, a, c)
+            )
+            menu.addAction(launch_action)
+
+            copy_action = QAction(f"复制: {menu_text}", self)
+            copy_action.setToolTip(menu_text)
+            copy_action.triggered.connect(
+                lambda _=False, p=pkg_name, a=alias_name, c=alias_command: self._copy_package_launch_cmd(p, a, c)
+            )
+            menu.addAction(copy_action)
+
+        menu.exec(global_pos)
 
     def _render_package_list(
         self,
@@ -2785,6 +3086,12 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
                 self.list_layout.addWidget(sep)
 
             row = QWidget()
+
+            def _show_pkg_context_menu(pos, *, n=pkg_name, d=pkg_dir, ro=remote_only, w=row):
+                self._show_package_row_context_menu(n, d, ro, w.mapToGlobal(pos))
+
+            row.setContextMenuPolicy(Qt.CustomContextMenu)
+            row.customContextMenuRequested.connect(_show_pkg_context_menu)
             row_lay = QHBoxLayout(row)
             row_lay.setContentsMargins(1, 0, 1, 0)
             row_lay.setSpacing(4)
@@ -2804,6 +3111,10 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
                 if not err:
                     self.package_sync_map[pkg_name] = sync
             label.setMinimumWidth(200)
+            label.setContextMenuPolicy(Qt.CustomContextMenu)
+            label.customContextMenuRequested.connect(
+                lambda pos, w=label, fn=_show_pkg_context_menu: fn(pos, w=w)
+            )
             row_lay.addWidget(label, 1)
             self.package_status_labels[pkg_name] = label
 
@@ -2821,6 +3132,10 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
                 btn_up.clicked.connect(lambda _=False, p=pkg_dir: self.upload_one(p))
             if row_busy:
                 btn_up.setEnabled(False)
+            btn_up.setContextMenuPolicy(Qt.CustomContextMenu)
+            btn_up.customContextMenuRequested.connect(
+                lambda pos, w=btn_up, fn=_show_pkg_context_menu: fn(pos, w=w)
+            )
             row_lay.addWidget(btn_up)
             self.row_buttons.append(btn_up)
 
@@ -2832,6 +3147,10 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
             btn_down.clicked.connect(lambda _=False, p=pkg_dir: self.download_one(p))
             if row_busy:
                 btn_down.setEnabled(False)
+            btn_down.setContextMenuPolicy(Qt.CustomContextMenu)
+            btn_down.customContextMenuRequested.connect(
+                lambda pos, w=btn_down, fn=_show_pkg_context_menu: fn(pos, w=w)
+            )
             row_lay.addWidget(btn_down)
             self.row_buttons.append(btn_down)
 
@@ -2851,6 +3170,10 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
                 btn_del_local.clicked.connect(lambda _=False, p=pkg_dir: self.delete_local_one(p))
             if row_busy:
                 btn_del_local.setEnabled(False)
+            btn_del_local.setContextMenuPolicy(Qt.CustomContextMenu)
+            btn_del_local.customContextMenuRequested.connect(
+                lambda pos, w=btn_del_local, fn=_show_pkg_context_menu: fn(pos, w=w)
+            )
             row_lay.addWidget(btn_del_local)
             self.row_buttons.append(btn_del_local)
 
@@ -2863,6 +3186,10 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
             btn_del_remote.clicked.connect(lambda _=False, p=pkg_dir: self.delete_remote_one(p))
             if row_busy:
                 btn_del_remote.setEnabled(False)
+            btn_del_remote.setContextMenuPolicy(Qt.CustomContextMenu)
+            btn_del_remote.customContextMenuRequested.connect(
+                lambda pos, w=btn_del_remote, fn=_show_pkg_context_menu: fn(pos, w=w)
+            )
             row_lay.addWidget(btn_del_remote)
             self.row_buttons.append(btn_del_remote)
 
@@ -2880,6 +3207,10 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
                 )
             if row_busy:
                 btn_refresh.setEnabled(False)
+            btn_refresh.setContextMenuPolicy(Qt.CustomContextMenu)
+            btn_refresh.customContextMenuRequested.connect(
+                lambda pos, w=btn_refresh, fn=_show_pkg_context_menu: fn(pos, w=w)
+            )
             row_lay.addWidget(btn_refresh)
             self.row_buttons.append(btn_refresh)
             if not remote_only:
@@ -2894,6 +3225,10 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
             btn_web.setToolTip(f"在浏览器中打开 https://github.com/{owner}/{pkg_name}")
             btn_web.clicked.connect(
                 lambda _=False, n=pkg_name: self._open_package_in_browser(n)
+            )
+            btn_web.setContextMenuPolicy(Qt.CustomContextMenu)
+            btn_web.customContextMenuRequested.connect(
+                lambda pos, w=btn_web, fn=_show_pkg_context_menu: fn(pos, w=w)
             )
             row_lay.addWidget(btn_web)
             self.row_buttons.append(btn_web)
@@ -4363,12 +4698,15 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
         import shlex
 
         script_path = Path(__file__).resolve()
-        cmd_list = [sys.executable, str(script_path)]
+        launch_args = list(sys.argv[1:])
+        cmd_list = [sys.executable, str(script_path), *launch_args]
         try:
             cmd_display = shlex.join(cmd_list)
         except Exception:
             cmd_display = " ".join(str(x) for x in cmd_list)
 
+        self._log(f"[restart] script_path: {script_path}")
+        self._log(f"[restart] launch_args: {launch_args}")
         self._log(f"[restart] cmd_list: {cmd_list}")
 
         dlg = QDialog(self)
@@ -4459,20 +4797,15 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
         def _spawn():
             lbl_status.setText("⏳ 正在启动新进程…")
             try:
-                creationflags = 0
-                if sys.platform == "win32":
-                    creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
-                    creationflags |= getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
-                    creationflags |= getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+                # 不使用 DETACHED_PROCESS / CREATE_NO_WINDOW，也不重定向 stdin/stdout/stderr。
+                # 这样当当前 GUI 是从 PowerShell/cmd 启动时，重启后的子进程会继承同一个控制台，
+                # 日志仍然输出到原来的终端；如果当前进程本身没有控制台，则按 Windows 默认行为启动。
                 dlg._proc = subprocess.Popen(
                     cmd_list,
                     cwd=str(script_path.parent),
                     env=os.environ.copy(),
-                    creationflags=creationflags,
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    close_fds=True,
+                    creationflags=0,
+                    close_fds=False,
                 )
             except Exception as exc:
                 dlg._spawn_error = f"{type(exc).__name__}: {exc}"
@@ -4661,6 +4994,11 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
 def main():
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--mode", choices=["server", "client"], default="")
+    parser.add_argument(
+        "--refresh-status",
+        action="store_true",
+        help="启动时扫描并刷新各包的 git 状态",
+    )
     args, _unknown = parser.parse_known_args()
     mode_map = {"server": "Server", "client": "Client"}
 
@@ -4721,7 +5059,12 @@ def main():
 
     if APP_ICON_FILE.exists():
         app.setWindowIcon(QIcon(str(APP_ICON_FILE)))
-    win = RepoSyncWindow(mode_map.get(args.mode) or None)
+    launch_command = " ".join(shlex.quote(part) for part in sys.argv)
+    win = RepoSyncWindow(
+        mode_map.get(args.mode) or None,
+        refresh_status_on_start=args.refresh_status,
+        launch_command=launch_command,
+    )
 
     # 收到第二个实例的连接时，激活本窗口
     def _on_new_connection():
