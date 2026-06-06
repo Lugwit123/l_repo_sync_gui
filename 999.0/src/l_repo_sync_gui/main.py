@@ -30,7 +30,6 @@ except ImportError:
 from pathlib import Path
 
 from PySide6.QtCore import QFile, QObject, Qt, QTimer, Signal
-from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtGui import QAction, QColor, QIcon, QSyntaxHighlighter, QTextCharFormat
 from PySide6.QtUiTools import QUiLoader
 from PySide6.QtWidgets import (
@@ -5040,23 +5039,6 @@ def main():
 
     app = QApplication(sys.argv)
 
-    # ---------- 单实例检测 ----------
-    server_name = "l_repo_sync_gui_single"
-    socket = QLocalSocket()
-    socket.connectToServer(server_name)
-    if socket.waitForConnected(500):
-        # 已有实例运行，通知它激活窗口后退出
-        socket.write(b"activate")
-        socket.waitForBytesWritten(500)
-        socket.disconnectFromServer()
-        print("[single-instance] 已有实例运行，已通知激活", file=sys.stderr, flush=True)
-        sys.exit(0)
-
-    # 当前是第一个实例，启动 server 监听
-    QLocalServer.removeServer(server_name)
-    server = QLocalServer()
-    server.listen(server_name)
-
     if APP_ICON_FILE.exists():
         app.setWindowIcon(QIcon(str(APP_ICON_FILE)))
     launch_command = " ".join(shlex.quote(part) for part in sys.argv)
@@ -5065,17 +5047,6 @@ def main():
         refresh_status_on_start=args.refresh_status,
         launch_command=launch_command,
     )
-
-    # 收到第二个实例的连接时，激活本窗口
-    def _on_new_connection():
-        conn = server.nextPendingConnection()
-        if conn:
-            win.showNormal()
-            win.raise_()
-            win.activateWindow()
-            conn.deleteLater()
-
-    server.newConnection.connect(_on_new_connection)
 
     win.show()
     sys.exit(app.exec())
