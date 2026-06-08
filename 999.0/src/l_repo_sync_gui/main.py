@@ -15,6 +15,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 import urllib.error
 import webbrowser
 import urllib.request
@@ -1462,6 +1463,27 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
         if self.btn_refresh_packages is not None:
             self.btn_refresh_packages.setEnabled(not busy)
 
+    def _run_blocking_with_events(self, func, *args, **kwargs):
+        """在后台线程执行阻塞函数，主线程等待时继续处理 Qt 事件，避免窗口假死。"""
+        box: dict[str, object] = {"done": False, "result": None, "exc": None}
+
+        def _worker():
+            try:
+                box["result"] = func(*args, **kwargs)
+            except Exception as exc:
+                box["exc"] = exc
+            finally:
+                box["done"] = True
+
+        thread = threading.Thread(target=_worker, daemon=True)
+        thread.start()
+        while not box["done"]:
+            QApplication.processEvents()
+            time.sleep(0.05)
+        if box["exc"] is not None:
+            raise box["exc"]
+        return box["result"]
+
     def _run_quiet(
         self,
         cmd: list[str],
@@ -1577,12 +1599,14 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
             git_args = cmd[1:]
             self._log(f"$ git {' '.join(git_args)}")
             if len(git_args) >= 2 and git_args[0] == "clone":
-                return git_helper.clone_from(
+                return self._run_blocking_with_events(
+                    git_helper.clone_from,
                     git_args[1],
                     Path(git_args[2]),
                     safe_dir=repo_safe,
                 )
-            return git_helper.execute_git(
+            return self._run_blocking_with_events(
+                git_helper.execute_git,
                 git_args,
                 cwd=cwd,
                 repo_dir=repo_safe,
@@ -3376,8 +3400,11 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
             remote_url = f"https://github.com/{owner}/{pkg_name}.git"
             self._run(["git", "remote", "add", "origin", remote_url], cwd=pkg_dir)
 
-        ok_push, msg_push = git_helper.push(
-            pkg_dir, branch, set_upstream=True
+        ok_push, msg_push = self._run_blocking_with_events(
+            git_helper.push,
+            pkg_dir,
+            branch,
+            set_upstream=True,
         )
         if ok_push:
             self._log(f"[ok] {pkg_name} created and pushed")
@@ -4435,7 +4462,11 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
                     ai_model = (self._ai_config or {}).get("model", "?")
                     self._log(f"[ok] {pkg_name} 使用 AI 生成提交注释 (provider={ai_provider}, model={ai_model})")
                 commit_msg = commit_msg or ""
-                ok_commit, msg_commit, commit_hash = git_helper.commit(pkg_dir, commit_msg)
+                ok_commit, msg_commit, commit_hash = self._run_blocking_with_events(
+                    git_helper.commit,
+                    pkg_dir,
+                    commit_msg,
+                )
                 if not ok_commit:
                     self._log(f"[WARN] {pkg_name} commit 失败: {msg_commit}")
                 elif commit_hash:
@@ -4460,7 +4491,12 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
                 self._confirm_push_with_oversized_files(pkg_name, oversized)
                 return
 
-            ok_push, msg_push = git_helper.push(pkg_dir, branch, set_upstream=True)
+            ok_push, msg_push = self._run_blocking_with_events(
+                git_helper.push,
+                pkg_dir,
+                branch,
+                set_upstream=True,
+            )
             if ok_push:
                 self._log(f"[ok] {pkg_name} pushed")
                 self._log_upload_summary(pkg_dir, pkg_name)
@@ -4478,8 +4514,12 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
                         self._confirm_push_with_oversized_files(pkg_name, oversized)
                         return
                     self._log(f"[warn] {pkg_name} 用户确认强制覆盖远端")
-                    ok_force, msg_force = git_helper.push(
-                        pkg_dir, branch, set_upstream=True, force_with_lease=True
+                    ok_force, msg_force = self._run_blocking_with_events(
+                        git_helper.push,
+                        pkg_dir,
+                        branch,
+                        set_upstream=True,
+                        force_with_lease=True,
                     )
                     if ok_force:
                         self._log(f"[ok] {pkg_name} 强制推送成功")

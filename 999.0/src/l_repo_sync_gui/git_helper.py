@@ -90,28 +90,32 @@ def execute_git(
     if not args:
         return False, "empty git command"
     repo_path = repo_dir or (Path(cwd) if cwd else None)
-    g = _git_instance(cwd, repo_path)
     run_env = _run_env(env)
     exec_args = list(args)
-    # 确保 args[0] 是 'git'，GitPython 的 execute() 要求如此
     if exec_args[0] != "git":
         exec_args = ["git"] + exec_args
-    if not getattr(g, "_git_options", None):
-        exec_args = [exec_args[0]] + git_multi_options(repo_path) + exec_args[1:]
-    exec_kwargs: dict = {
-        "with_exceptions": True,
-        "as_process": False,
-        "stdout_as_string": True,
-        "env": run_env,
-    }
-    if timeout and timeout > 0 and not _on_windows():
-        exec_kwargs["kill_after_timeout"] = int(timeout)
+    exec_args = [exec_args[0]] + git_multi_options(repo_path) + exec_args[1:]
     try:
-        out = g.execute(exec_args, **exec_kwargs)
-        return True, (out or "").strip()
-    except GitCommandError as exc:
-        return False, _format_git_error(exc)
-    except GitCommandNotFound as exc:
+        proc = subprocess.run(
+            exec_args,
+            cwd=str(cwd) if cwd else None,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=run_env,
+            timeout=timeout if timeout and timeout > 0 else None,
+            check=False,
+        )
+        out = (proc.stdout or "").strip()
+        err = (proc.stderr or "").strip()
+        if proc.returncode != 0:
+            merged = "\n".join(x for x in [out, err] if x)
+            return False, merged or f"exit code={proc.returncode}"
+        return True, out
+    except subprocess.TimeoutExpired as exc:
+        return False, f"git 命令超时({timeout}s): {' '.join(exec_args)}\n{exc}"
+    except FileNotFoundError as exc:
         return False, f"Git 未安装或不在 PATH 中: {exc}"
     except Exception as exc:
         return False, str(exc)
@@ -137,25 +141,12 @@ def clone_from(
 ) -> tuple[bool, str]:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    opts = git_multi_options(safe_dir or path)
-    env = _run_env()
-    clone_kwargs: dict = {
-        "url": url,
-        "to_path": str(path),
-        "env": env,
-        "multi_options": opts,
-    }
-    if timeout > 0 and not _on_windows():
-        clone_kwargs["kill_after_timeout"] = int(timeout)
-    try:
-        Repo.clone_from(**clone_kwargs)
-        return True, ""
-    except GitCommandError as exc:
-        return False, _format_git_error(exc)
-    except GitCommandNotFound as exc:
-        return False, f"Git 未安装或不在 PATH 中: {exc}"
-    except Exception as exc:
-        return False, str(exc)
+    return execute_git(
+        ["clone", url, str(path)],
+        cwd=path.parent,
+        repo_dir=safe_dir or path,
+        timeout=timeout,
+    )
 
 
 def open_repo(pkg_dir: Path) -> Repo | None:
