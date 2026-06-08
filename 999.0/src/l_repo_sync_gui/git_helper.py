@@ -47,6 +47,9 @@ def _git_instance(cwd: Path | str | None = None, repo_dir: Path | None = None) -
 def _run_env(extra: dict | None = None) -> dict[str, str]:
     env = os.environ.copy()
     env["GIT_HTTP_CONNECT_TIMEOUT"] = str(GIT_HTTP_CONNECT_TIMEOUT_SEC)
+    # 禁止 Git/GCM 弹出交互式凭据提示，避免 GUI 上传/下载时长时间假死。
+    env.setdefault("GIT_TERMINAL_PROMPT", "0")
+    env.setdefault("GCM_INTERACTIVE", "never")
     if extra:
         env.update(extra)
     return env
@@ -255,25 +258,31 @@ def push(
     remote: str = "origin",
     set_upstream: bool = True,
     force_with_lease: bool = False,
+    timeout: float = 300,
 ) -> tuple[bool, str]:
-    """推送分支到远端。"""
-    repo = open_repo(pkg_dir)
-    if repo is None:
+    """推送分支到远端。
+
+    使用 git 命令而不是 Repo.remote().push()，避免 GitPython push 在 Windows
+    网络异常或凭据交互时长时间阻塞且无法设置超时。
+    """
+    if open_repo(pkg_dir) is None:
         return False, "非 git 仓库"
-    try:
-        remote_obj = repo.remotes[remote]
-        refspec = branch
-        kwargs: dict = {}
-        if force_with_lease:
-            kwargs["force_with_lease"] = True
-        if set_upstream:
-            kwargs["set_upstream"] = True
-        remote_obj.push(refspec=refspec, **kwargs)
-        return True, ""
-    except GitCommandError as exc:
-        return False, _format_git_error(exc)
-    except Exception as exc:
-        return False, str(exc)
+    args = ["push"]
+    if set_upstream:
+        args.append("--set-upstream")
+    if force_with_lease:
+        args.append("--force-with-lease")
+    args.extend([remote, branch])
+    return execute_git(
+        args,
+        cwd=pkg_dir,
+        repo_dir=pkg_dir,
+        timeout=timeout,
+        env={
+            "GIT_TERMINAL_PROMPT": "0",
+            "GCM_INTERACTIVE": "never",
+        },
+    )
 
 
 def cat_file_batch_check(pkg_dir: Path, stdin_text: str) -> tuple[bool, str]:
