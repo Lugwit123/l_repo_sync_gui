@@ -4199,17 +4199,8 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
     def _preview_upload_files(self, pkg_dir: Path) -> list[str]:
         """上传确认显示远端差异，并补充本地未提交改动提示。"""
         out: list[str] = []
-        self._log("$ git fetch --all --prune  # 上传预览短超时")
-        ok_fetch, msg_fetch = self._run_blocking_with_events(
-            git_helper.execute_git,
-            ["fetch", "--all", "--prune"],
-            cwd=pkg_dir,
-            repo_dir=pkg_dir,
-            timeout=3,
-        )
-        if not ok_fetch:
-            out.append(f"[WARN] 上传预览刷新远端引用失败或超时，将使用本地缓存的远端引用: {msg_fetch}")
-            out.append("")
+        out.append("[INFO] 上传预览不执行 git fetch，避免网络慢导致界面卡顿；远端差异使用本地缓存的 origin 引用。")
+        out.append("")
         compare_ref, compare_desc = self._resolve_compare_ref(pkg_dir)
         ok_status, status_lines = self._status_lines(pkg_dir)
 
