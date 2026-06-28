@@ -3858,7 +3858,14 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
         return confirm == QMessageBox.Yes
 
     def _force_download_workspace(self, pkg_dir: Path, pkg_name: str, upstream_ref: str | None = None) -> bool:
-        """fetch + reset --hard + clean -fd 强制同步远端到本地。"""
+        """fetch + reset --hard + clean -fd 强制同步远端到本地。
+
+        若工作区有文件被运行中的程序占用（Windows 下 unlink 报 "Invalid
+        argument" / "Permission denied"），reset --hard 会整体失败。此时退
+        而求其次：用 reset --mixed 把 HEAD+索引推进到远端（不动工作区，不会
+        因占用失败），再尽力 checkout/clean 覆盖其余文件，跳过被占用的文件
+        （通常是运行时日志，可忽略），并提示用户。
+        """
         repo = self._repo(pkg_dir)
         if repo is None:
             self._log(f"[ERR] {pkg_name} 不是 git 仓库")
@@ -3878,8 +3885,38 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
                     target_ref = "origin/main"
                 self._log(f"[warn] {pkg_name} 无上游分支，回退使用 {target_ref}")
 
-            repo.git.reset("--hard", target_ref)
-            repo.git.clean("-fd")
+            try:
+                repo.git.reset("--hard", target_ref)
+                repo.git.clean("-fd")
+            except Exception as exc:
+                locked = self._parse_locked_paths(str(exc))
+                if not locked:
+                    raise
+                # 有文件被占用：HEAD+索引先推进到远端（安全，不动工作区）
+                self._log(
+                    f"[warn] {pkg_name} 以下文件被运行中的程序占用，无法覆盖，将跳过: "
+                    + ", ".join(locked)
+                )
+                repo.git.reset("--mixed", target_ref)
+                # 尽力把其余文件覆盖为远端版本（被占用的文件会被跳过）
+                try:
+                    repo.git.checkout("--", ".")
+                except Exception:
+                    pass
+                try:
+                    repo.git.clean("-fd")
+                except Exception:
+                    pass
+                QMessageBox.warning(
+                    self,
+                    "强制下载部分完成",
+                    f"{pkg_name} 已同步到远端，但以下文件正被运行中的程序占用、未能覆盖：\n\n"
+                    + "\n".join(locked)
+                    + "\n\n这些通常是运行时日志，可忽略。\n如需彻底覆盖，请关闭占用这些文件的程序后重试。",
+                )
+                self._log(
+                    f"[ok] {pkg_name} 强制下载完成（已跳过 {len(locked)} 个被占用文件）")
+                return True
         except Exception as exc:
             self._log(f"[ERR] {pkg_name} 强制下载失败: {exc}")
             QMessageBox.warning(self, "下载失败", f"{pkg_name} 强制下载失败:\n{exc}")
@@ -3887,6 +3924,21 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
 
         self._log(f"[ok] {pkg_name} 强制下载完成（已覆盖本地）")
         return True
+
+    @staticmethod
+    def _parse_locked_paths(err_text: str) -> list[str]:
+        """从 git 错误输出中解析被占用/无法删除的文件路径。
+
+        典型形态：
+            error: unable to unlink old 'xxx/yyy.log': Invalid argument
+            error: unable to create file 'xxx': Permission denied
+        """
+        paths: list[str] = []
+        for m in re.finditer(r"unable to (?:unlink|create)(?: old| file)? '([^']+)'", err_text):
+            p = m.group(1)
+            if p not in paths:
+                paths.append(p)
+        return paths
 
     def _clip_lines(self, lines: list[str], limit: int = PREVIEW_MAX_LINES) -> list[str]:
         clipped = [x for x in lines if x is not None]
