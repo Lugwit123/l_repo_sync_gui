@@ -160,6 +160,16 @@
          </widget>
         </item>
         <item>
+         <widget class="QPushButton" name="btn_upload_selected">
+          <property name="toolTip">
+           <string>上传左侧列表中已勾选的包（逐个弹出确认框）</string>
+          </property>
+          <property name="text">
+           <string>上传选中</string>
+          </property>
+         </widget>
+        </item>
+        <item>
          <widget class="QPushButton" name="btn_upload_all">
           <property name="text">
            <string>批量上传</string>

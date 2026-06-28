@@ -444,6 +444,9 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
         self.package_sync_map: dict[str, dict[str, int]] = {}
         self.package_merge_buttons: dict[str, QPushButton] = {}
         self.package_refresh_buttons: dict[str, QPushButton] = {}
+        # 每行勾选框：供「上传选中」批量上传使用（按包名跟踪，跨行复用保留）
+        self.package_checkboxes: dict[str, QCheckBox] = {}
+        self.btn_upload_selected: QPushButton | None = None
         self.btn_refresh_status: QPushButton | None = None
         self.btn_refresh_packages: QPushButton | None = None
         self.ai_ask_btn: QPushButton | None = None
@@ -573,6 +576,8 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
         self.btn_refresh_status = central.findChild(
             QPushButton, "btn_refresh_status")
         self.ai_ask_btn = central.findChild(QPushButton, "ai_ask_btn")
+        self.btn_upload_selected = central.findChild(
+            QPushButton, "btn_upload_selected")
         btn_upload_all = central.findChild(QPushButton, "btn_upload_all")
         btn_download_all = central.findChild(QPushButton, "btn_download_all")
         btn_restart = central.findChild(QPushButton, "btn_restart")
@@ -620,6 +625,8 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
         self.btn_refresh_packages.clicked.connect(self.refresh_packages)
         self.btn_refresh_status.clicked.connect(self.refresh_package_status)
         btn_upload_all.clicked.connect(self.upload_all)
+        if self.btn_upload_selected is not None:
+            self.btn_upload_selected.clicked.connect(self.upload_selected)
         btn_download_all.clicked.connect(self.download_all)
         btn_restart.clicked.connect(self.restart_self)
         if update_log_btn:
@@ -1637,47 +1644,22 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
             self._main_invoker.post(fn)
 
     def _run_blocking_with_events(self, func, *args, **kwargs):
-        """在 Qt 托管线程池执行阻塞函数，主线程用 QEventLoop 等待。
+        """同步执行阻塞函数（git clone/commit/push 等子进程操作）。
 
-        关键：等待期间必须保持 Qt 事件循环运行（仅排除用户输入），否则
-        主线程冻结时 Qt 无法处理积压的 DeferredDelete / 跨线程信号清理，
-        在后台线程（如 AI worker）结束销毁其线程数据时会触发
-        "QThreadStorage: entry destroyed before end of thread" → abort()。
+        历史教训（fault 日志 11 次崩溃均指向同一处）：
+        曾用「后台 QThreadPool 线程 + 主线程嵌套 QEventLoop 等待」的方案，
+        想在等 git 时保持窗口响应。但主线程在嵌套事件循环里会**重入**处理：
+          - 原生 Windows 消息 → tray_window.nativeEvent
+          - 跨线程投递的回调 → _MainThreadInvoker._invoke
+        并在后台 worker 线程销毁其 Qt 线程数据时触发
+        "QThreadStorage: entry destroyed before end of thread" → abort()，
+        且该 abort 来自 C++ 层，Python try/except 无法捕获。
 
-        ExcludeUserInputEvents：处理 DeferredDelete / 定时器 / 重绘 / 跨线程
-        投递的清理，但屏蔽鼠标键盘，避免在 git 进行中重入其它操作。
-        _set_busy(True) 已禁用按钮，配合 _blocking_in_progress 双重保险。
+        这里包裹的全部是数秒级的 git 子进程调用（无长任务，AI 走 urllib
+        不经此函数），因此改为**纯同步执行**：不起 worker 线程、不泵嵌套
+        事件循环。代价是 git 执行期间窗口短暂无响应，但彻底消除崩溃路径。
         """
-        if QThread.currentThread() is not self.thread():
-            # 已在后台线程中调用：直接同步执行，无需再起线程 / 事件循环。
-            return func(*args, **kwargs)
-
-        if self._blocking_in_progress:
-            self._log("[WARN] _run_blocking_with_events 重入，回退到同步执行")
-            return func(*args, **kwargs)
-
-        self._blocking_in_progress = True
-        try:
-            box: dict[str, object] = {"result": None, "exc": None}
-            loop = QEventLoop()
-
-            def _worker():
-                try:
-                    box["result"] = func(*args, **kwargs)
-                except Exception as exc:
-                    box["exc"] = exc
-                finally:
-                    # 回主线程退出事件循环（loop.quit 必须在主线程调用）
-                    self._main_invoker.post(loop.quit)
-
-            QThreadPool.globalInstance().start(_FnRunnable(_worker))
-            loop.exec(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
-
-            if box["exc"] is not None:
-                raise box["exc"]
-            return box["result"]
-        finally:
-            self._blocking_in_progress = False
+        return func(*args, **kwargs)
 
     def _run_quiet(
         self,
@@ -3365,6 +3347,7 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
         old_labels = dict(self.package_status_labels)
         old_buttons = dict(self.package_row_buttons)
         old_merge: dict[str, QPushButton] = dict(self.package_merge_buttons)
+        old_checkboxes: dict[str, QCheckBox] = dict(self.package_checkboxes)
 
         self.row_buttons = []
         self.package_row_buttons = {}
@@ -3372,6 +3355,7 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
         self.package_sync_map = {}
         self.package_merge_buttons = {}
         self.package_refresh_buttons = {}
+        self.package_checkboxes = {}
         self.package_entries = package_entries
 
         remote_section_started = False
@@ -3401,6 +3385,7 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
                 label = old_labels.get(pkg_name)
                 buttons = old_buttons.get(pkg_name, {})
                 merge_btn = old_merge.get(pkg_name)
+                chk = old_checkboxes.get(pkg_name)
             else:
                 # ★ 创建新行
                 row = QWidget()
@@ -3417,6 +3402,16 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
                 row_lay = QHBoxLayout(row)
                 row_lay.setContentsMargins(1, 0, 1, 0)
                 row_lay.setSpacing(4)
+
+                # 行首勾选框：供顶部「上传选中」批量上传（仅本地可上传的包）
+                if remote_only:
+                    chk = None
+                else:
+                    chk = QCheckBox()
+                    chk.setFocusPolicy(Qt.NoFocus)
+                    chk.setMaximumWidth(22)
+                    chk.setToolTip("勾选后点顶部「上传选中」批量上传")
+                    row_lay.addWidget(chk)
 
                 label = QLabel()
                 label.setMinimumWidth(200)
@@ -3612,6 +3607,8 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
             self.package_row_buttons[pkg_name] = buttons
             if merge_btn is not None:
                 self.package_merge_buttons[pkg_name] = merge_btn
+            if chk is not None:
+                self.package_checkboxes[pkg_name] = chk
 
             # --- 添加到 layout（分隔线每次重建）---
             self.list_layout.addWidget(row)
@@ -5165,6 +5162,25 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
         for _, pkg_dir, remote_only in self._package_entries():
             if remote_only:
                 continue
+            self.upload_one(pkg_dir)
+
+    def upload_selected(self):
+        """上传列表中已勾选的本地包（逐个调用 upload_one）。"""
+        if not self._check_tools():
+            return
+        selected: list[Path] = []
+        for name, pkg_dir, remote_only in self._package_entries():
+            if remote_only:
+                continue
+            chk = self.package_checkboxes.get(name)
+            if chk is not None and _qt_alive(chk) and chk.isChecked():
+                selected.append(pkg_dir)
+        if not selected:
+            QMessageBox.information(
+                self, "上传选中", "未勾选任何可上传的包。\n请在左侧列表勾选要上传的包。")
+            return
+        self._log(f"[info] 批量上传选中：{len(selected)} 个包")
+        for pkg_dir in selected:
             self.upload_one(pkg_dir)
 
     def download_all(self):
