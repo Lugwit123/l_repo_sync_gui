@@ -31,7 +31,7 @@ except ImportError:
     winreg = None
 from pathlib import Path
 
-from PySide6.QtCore import QFile, QObject, QRunnable, Qt, QThread, QThreadPool, QTimer, Signal
+from PySide6.QtCore import QEventLoop, QFile, QObject, QRunnable, Qt, QThread, QThreadPool, QTimer, Signal
 from PySide6.QtGui import QAction, QColor, QIcon, QSyntaxHighlighter, QTextCharFormat
 from PySide6.QtUiTools import QUiLoader
 from PySide6.QtWidgets import (
@@ -1619,20 +1619,29 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
             self._main_invoker.post(fn)
 
     def _run_blocking_with_events(self, func, *args, **kwargs):
-        """在后台线程执行阻塞函数，主线程同步等待（不走 Qt 事件循环）。
+        """在 Qt 托管线程池执行阻塞函数，主线程用 QEventLoop 等待。
 
-        上传/下载期间 _set_busy(True) 已禁用所有按钮，无需保持 UI 响应。
-        不走 Qt 事件循环可完全避免 DeferredDelete / 跨线程信号 / 托盘消息
-        在 git 操作期间触发 shiboken6 abort() 导致静默崩溃。
+        关键：等待期间必须保持 Qt 事件循环运行（仅排除用户输入），否则
+        主线程冻结时 Qt 无法处理积压的 DeferredDelete / 跨线程信号清理，
+        在后台线程（如 AI worker）结束销毁其线程数据时会触发
+        "QThreadStorage: entry destroyed before end of thread" → abort()。
+
+        ExcludeUserInputEvents：处理 DeferredDelete / 定时器 / 重绘 / 跨线程
+        投递的清理，但屏蔽鼠标键盘，避免在 git 进行中重入其它操作。
+        _set_busy(True) 已禁用按钮，配合 _blocking_in_progress 双重保险。
         """
+        if QThread.currentThread() is not self.thread():
+            # 已在后台线程中调用：直接同步执行，无需再起线程 / 事件循环。
+            return func(*args, **kwargs)
+
         if self._blocking_in_progress:
             self._log("[WARN] _run_blocking_with_events 重入，回退到同步执行")
             return func(*args, **kwargs)
 
         self._blocking_in_progress = True
         try:
-            box: dict[str, object] = {
-                "done": False, "result": None, "exc": None}
+            box: dict[str, object] = {"result": None, "exc": None}
+            loop = QEventLoop()
 
             def _worker():
                 try:
@@ -1640,17 +1649,11 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
                 except Exception as exc:
                     box["exc"] = exc
                 finally:
-                    box["done"] = True
+                    # 回主线程退出事件循环（loop.quit 必须在主线程调用）
+                    self._main_invoker.post(loop.quit)
 
-            thread = _FnRunnable(_worker)
-            QThreadPool.globalInstance().start(thread)
-
-            # ★ 纯阻塞等待，不处理任何 Qt 事件 ★
-            # QEventLoop / processEvents() 会处理积压的 DeferredDelete、
-            # 托盘 LUGWIT_SHOW_WINDOW 消息、跨线程信号等，在 git 操作进行中
-            # 触发 C++ 层访问已删除控件 → shiboken6 abort()
-            while not box["done"]:
-                time.sleep(0.05)
+            QThreadPool.globalInstance().start(_FnRunnable(_worker))
+            loop.exec(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
 
             if box["exc"] is not None:
                 raise box["exc"]
