@@ -65,6 +65,24 @@ from l_qt_wgt_lib.smart_widget import CodeEditorWidget, LogCodeHighlighter
 from l_qt_wgt_lib.tray_window import TrayAwareMixin
 from pytracemp import lprint, LPrint
 
+try:
+    import shiboken6
+except ImportError:
+    shiboken6 = None
+
+
+def _qt_alive(obj) -> bool:
+    """判断 PySide6 包装的 C++ 对象是否仍存活（未被 deleteLater 删除）。"""
+    if obj is None:
+        return False
+    if shiboken6 is None:
+        return True
+    try:
+        return shiboken6.isValid(obj)
+    except Exception:
+        return False
+
+
 IGNORE_LINES = [
     "__pycache__/",
     "*.pyc",
@@ -4004,20 +4022,26 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
                             cwd=file_apply_pkg_dir,
                         )
                         if ok:
-                            self._post_main(
-                                lambda: lbl_apply.setText("已写入本地工作区。"))
                             self._log(
                                 f"[ok] 单文件写入本地: {_relpath} ← {upstream_ref}")
-                        else:
-                            def _show_err():
+
+                        def _update_ui():
+                            # 对话框可能已关闭、控件已 deleteLater，访问已删除的
+                            # C++ 对象会直接 abort（非 Python 异常，无法 try 捕获）。
+                            if not _qt_alive(btn_apply):
+                                return
+                            if ok:
+                                lbl_apply.setText("已写入本地工作区。")
+                            else:
                                 lbl_apply.setText("应用失败。")
                                 QMessageBox.warning(
-                                    dlg,
+                                    dlg if _qt_alive(dlg) else self,
                                     "单文件合并到本地失败",
                                     f"{pkg_name}\n文件: {_relpath}\nref: {upstream_ref}\n\n{msg}",
                                 )
-                            self._post_main(_show_err)
-                        self._post_main(lambda: btn_apply.setEnabled(True))
+                            btn_apply.setEnabled(True)
+
+                        self._post_main(_update_ui)
 
                     self._start_worker(_worker)
 
@@ -4051,6 +4075,8 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
                     if not w:
                         return
                     btn, status, editor, btn_write, state = w
+                    if not _qt_alive(btn):
+                        return
                     btn.setEnabled(True)
                     if ok:
                         status.setText("已生成合并预览（未写入磁盘）。")
@@ -4064,6 +4090,15 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
                         btn_write.setEnabled(False)
 
                 preview_bridge.finished.connect(_on_preview_ready)
+
+                # 对话框关闭后断开连接：AI worker 可能仍在后台运行并迟到 emit，
+                # 此时对话框控件已 deleteLater，槽函数访问会触发 abort。
+                def _disconnect_preview_bridge(*_a):
+                    try:
+                        preview_bridge.finished.disconnect()
+                    except (RuntimeError, TypeError):
+                        pass
+                dlg.finished.connect(_disconnect_preview_bridge)
 
                 for relpath in both_files:
                     file_tab = QWidget(dlg)
@@ -4208,11 +4243,13 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
             current_ai_text = {"text": ""}
 
             def _append_status(msg: str):
+                if not _qt_alive(ai_trace_edit):
+                    return
                 ai_trace_edit.append(msg)
                 ai_trace_edit.ensureCursorVisible()
 
             def _append_chunk(chunk: str):
-                if not chunk:
+                if not chunk or not _qt_alive(ai_detail_edit):
                     return
                 current_ai_text["text"] += chunk
                 ai_detail_edit.setPlainText(current_ai_text["text"])
@@ -4224,6 +4261,8 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
                 ai_detail_edit.setTextCursor(cursor)
 
             def _finish_stream(ok: bool, message: str):
+                if not _qt_alive(ai_btn):
+                    return
                 ai_btn.setEnabled(True)
                 ai_btn.setText("AI查看修改详情")
                 if ok:
@@ -4239,6 +4278,19 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
             stream_bridge.status.connect(_append_status)
             stream_bridge.chunk.connect(_append_chunk)
             stream_bridge.finished.connect(_finish_stream)
+
+            # 对话框关闭后断开连接：流式 AI worker（urllib 读最长 90s）可能在
+            # 用户点 Yes 后仍在后台运行并迟到 emit chunk/status/finished，
+            # 而对话框控件此时已 deleteLater，槽函数访问已删除控件 → abort。
+            # worker 闭包持有 stream_bridge 引用，断开后迟到 emit 安全落空。
+            def _disconnect_stream_bridge(*_a):
+                for _sig in (stream_bridge.status, stream_bridge.chunk,
+                             stream_bridge.finished):
+                    try:
+                        _sig.disconnect()
+                    except (RuntimeError, TypeError):
+                        pass
+            dlg.finished.connect(_disconnect_stream_bridge)
 
             def _run_ai_review():
                 ai_btn.setEnabled(False)
