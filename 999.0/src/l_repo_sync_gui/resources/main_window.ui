@@ -6,7 +6,7 @@
    <rect>
     <x>0</x>
     <y>0</y>
-    <width>1134</width>
+    <width>1239</width>
     <height>680</height>
    </rect>
   </property>
@@ -177,6 +177,13 @@
          <widget class="QPushButton" name="btn_restart">
           <property name="text">
            <string>重启</string>
+          </property>
+         </widget>
+        </item>
+        <item>
+         <widget class="QPushButton" name="update_log_btn">
+          <property name="text">
+           <string>更新日志</string>
           </property>
          </widget>
         </item>
@@ -368,8 +375,8 @@
             <rect>
              <x>0</x>
              <y>0</y>
-             <width>437</width>
-             <height>144</height>
+             <width>479</width>
+             <height>132</height>
             </rect>
            </property>
            <layout class="QVBoxLayout" name="list_layout">

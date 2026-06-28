@@ -4,6 +4,7 @@ import concurrent.futures
 import ctypes
 import datetime
 import difflib
+import faulthandler
 import json
 import logging
 import os
@@ -30,7 +31,7 @@ except ImportError:
     winreg = None
 from pathlib import Path
 
-from PySide6.QtCore import QFile, QObject, Qt, QTimer, Signal
+from PySide6.QtCore import QEventLoop, QFile, QObject, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QColor, QIcon, QSyntaxHighlighter, QTextCharFormat
 from PySide6.QtUiTools import QUiLoader
 from PySide6.QtWidgets import (
@@ -57,6 +58,7 @@ from PySide6.QtWidgets import (
     QTabWidget,
     QVBoxLayout,
     QWidget,
+    QTextBrowser,
     QTextEdit,
 )
 from l_qt_wgt_lib.smart_widget import CodeEditorWidget, LogCodeHighlighter
@@ -102,6 +104,26 @@ REMOTE_FETCH_MAX_WORKERS = 8
 SILICONFLOW_URL = "https://api.siliconflow.cn/v1/chat/completions"
 # 国内硅基流动：直连，不走系统/环境代理（避免误走公司代理导致失败或变慢）
 _SILICONFLOW_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+CHANGELOG_MARKDOWN = """# 更新日志
+
+## 2026-06-20
+
+### 修复 l_repo_sync_gui 启动后直接退出
+
+- 修复 `RepoSyncWindow(TrayAwareMixin, QMainWindow)` 初始化后，调用 `setWindowTitle()` 时进程直接退出的问题。
+- 根因是 `TrayAwareMixin` 继承了 `QWidget`，导致 PySide6 多继承时改变 Qt 对象初始化顺序，底层 `QMainWindow` 未按预期初始化。
+- 将 `TrayAwareMixin` 改为纯 Python mixin，不再继承 `QWidget`，避免 Qt 原生层崩溃。
+- 窗口标题不再拼接完整启动命令，改为固定显示 `Rez Package Repo Sync`，启动命令仅保存在内部字段中。
+
+### 诊断改进
+
+- 增加启动阶段日志，记录 `QApplication`、`RepoSyncWindow`、UI 加载、窗口显示等关键节点。
+- 增加 `faulthandler` 崩溃日志，辅助排查 PySide6 / Qt 原生层直接退出的问题。
+- 启动诊断日志路径：`%TEMP%/l_repo_sync_gui/logs/sync_YYYY-MM-DD.log`。
+- 原生崩溃日志路径：`%TEMP%/l_repo_sync_gui/logs/fault_YYYY-MM-DD.log`。
+"""
 
 
 def _siliconflow_urlopen(req: urllib.request.Request, timeout: float):
@@ -212,6 +234,26 @@ def _set_windows_app_id():
         pass
 
 
+def _runtime_log_path() -> Path:
+    log_dir = Path(os.environ.get("TEMP", ".")) / "l_repo_sync_gui" / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    return log_dir / f"sync_{datetime.datetime.now():%Y-%m-%d}.log"
+
+
+def _write_runtime_log(message: str, *, echo: bool = False) -> None:
+    line = f"{datetime.datetime.now():%Y-%m-%d %H:%M:%S} {message}"
+    try:
+        with _runtime_log_path().open("a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+    except Exception:
+        pass
+    if echo:
+        try:
+            print(line, file=sys.stderr, flush=True)
+        except Exception:
+            pass
+
+
 def parse_rez_package_aliases(package_text: str) -> list[tuple[str, str]]:
     """从 Rez package.py 文本中解析 alias(name, command)。
 
@@ -315,11 +357,13 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
         title_parts = ["Rez Package Repo Sync"]
         if launch_mode:
             title_parts.append(launch_mode)
-        if launch_command:
-            title_parts.append(launch_command)
+        self._launch_command = launch_command or ""
         self.setWindowTitle(" - ".join(title_parts))
         self.resize(1280, 820)
         self.setMinimumSize(1100, 700)
+        # 防重入标志：防止 _run_blocking_with_events / _log 嵌套调用导致 Qt C++ 层崩溃
+        self._blocking_in_progress = False
+        self._log_recursion_guard = False
         if APP_ICON_FILE.exists():
             self.setWindowIcon(QIcon(str(APP_ICON_FILE)))
 
@@ -380,6 +424,8 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
         ui_file.open(QFile.ReadOnly)
         central = loader.load(ui_file, self)
         ui_file.close()
+        if central is None:
+            raise RuntimeError(f"QUiLoader failed to load UI: {ui_path}; error={loader.errorString()}")
         self.setCentralWidget(central)
     
         # 绑定 .ui 中通过 objectName 定义的控件
@@ -450,6 +496,7 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
         btn_upload_all = central.findChild(QPushButton, "btn_upload_all")
         btn_download_all = central.findChild(QPushButton, "btn_download_all")
         btn_restart = central.findChild(QPushButton, "btn_restart")
+        update_log_btn = central.findChild(QPushButton, "update_log_btn")
         btn_save_token = central.findChild(QPushButton, "btn_save_token")
         btn_clear_token = central.findChild(QPushButton, "btn_clear_token")
         btn_auth_status = central.findChild(QPushButton, "btn_auth_status")
@@ -492,6 +539,8 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
         btn_upload_all.clicked.connect(self.upload_all)
         btn_download_all.clicked.connect(self.download_all)
         btn_restart.clicked.connect(self.restart_self)
+        if update_log_btn:
+            update_log_btn.clicked.connect(self._open_update_log_dialog)
         btn_save_token.clicked.connect(self._save_auth_settings)
         btn_clear_token.clicked.connect(self._clear_auth_token)
         btn_auth_status.clicked.connect(self._check_github_auth)
@@ -508,6 +557,22 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
     
         self._load_auth_settings()
         self._load_network_settings()
+
+    def _open_update_log_dialog(self):
+        dlg = QDialog(self)
+        dlg.setWindowTitle("更新日志")
+        dlg.resize(780, 620)
+
+        layout = QVBoxLayout(dlg)
+        browser = QTextBrowser(dlg)
+        browser.setOpenExternalLinks(True)
+        browser.setMarkdown(CHANGELOG_MARKDOWN)
+        layout.addWidget(browser)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Close, dlg)
+        buttons.rejected.connect(dlg.reject)
+        layout.addWidget(buttons)
+        dlg.exec()
 
     def _github_token(self) -> str:
         return (self.gh_token_edit.text() or "").strip()
@@ -1464,25 +1529,51 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
             self.btn_refresh_packages.setEnabled(not busy)
 
     def _run_blocking_with_events(self, func, *args, **kwargs):
-        """在后台线程执行阻塞函数，主线程等待时继续处理 Qt 事件，避免窗口假死。"""
-        box: dict[str, object] = {"done": False, "result": None, "exc": None}
+        """在后台线程执行阻塞函数，主线程通过 QEventLoop 等待，保持 UI 响应。
 
-        def _worker():
-            try:
-                box["result"] = func(*args, **kwargs)
-            except Exception as exc:
-                box["exc"] = exc
-            finally:
-                box["done"] = True
+        使用 QEventLoop + QTimer 轮询代替裸 processEvents() 循环：
+        - 排除用户输入事件（ExcludeUserInputEvents），防止上传期间误触按钮导致重入
+        - QEventLoop 正确管理事件处理生命周期，避免裸 processEvents() 的潜在崩溃
+        """
+        if self._blocking_in_progress:
+            self._log("[WARN] _run_blocking_with_events 重入，回退到同步执行")
+            return func(*args, **kwargs)
 
-        thread = threading.Thread(target=_worker, daemon=True)
-        thread.start()
-        while not box["done"]:
-            QApplication.processEvents()
-            time.sleep(0.05)
-        if box["exc"] is not None:
-            raise box["exc"]
-        return box["result"]
+        self._blocking_in_progress = True
+        try:
+            box: dict[str, object] = {"done": False, "result": None, "exc": None}
+
+            def _worker():
+                try:
+                    box["result"] = func(*args, **kwargs)
+                except Exception as exc:
+                    box["exc"] = exc
+                finally:
+                    box["done"] = True
+
+            thread = threading.Thread(target=_worker, daemon=True)
+            thread.start()
+
+            # 使用 QEventLoop 替代裸 processEvents() 循环
+            # ExcludeUserInputEvents: 禁止用户交互事件（点击/键盘），防止重入操作
+            loop = QEventLoop()
+            poll_timer = QTimer()
+            poll_timer.setInterval(50)
+
+            def _poll():
+                if box["done"]:
+                    poll_timer.stop()
+                    loop.quit()
+
+            poll_timer.timeout.connect(_poll)
+            poll_timer.start()
+            loop.exec(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
+
+            if box["exc"] is not None:
+                raise box["exc"]
+            return box["result"]
+        finally:
+            self._blocking_in_progress = False
 
     def _run_quiet(
         self,
@@ -1516,21 +1607,30 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
         return False, f"unsupported command: {cmd[0]}"
 
     def _log(self, text: str):
-        """输出日志到 GUI、终端和日志文件。"""
+        """输出日志到 GUI、终端和日志文件。
+
+        防递归：如果检测到重入，跳过 processEvents() 避免嵌套事件处理。
+        """
         now = datetime.datetime.now().strftime("%H:%M:%S")
         log_line = f"[{now}] {text}"
 
-        # 1. 输出到 GUI 日志组件（CodeEditorWidget 内部为 QPlainTextEdit）
-        scroll = self._list_scroll_pos()
-        inner = self.log_edit.editor()
-        inner.appendPlainText(log_line)
-        inner.ensureCursorVisible()
-        QApplication.processEvents()
-        self._restore_list_scroll(scroll)
-        
+        reentrant = self._log_recursion_guard
+        self._log_recursion_guard = True
+        try:
+            # 1. 输出到 GUI 日志组件（CodeEditorWidget 内部为 QPlainTextEdit）
+            scroll = self._list_scroll_pos()
+            inner = self.log_edit.editor()
+            inner.appendPlainText(log_line)
+            inner.ensureCursorVisible()
+            if not reentrant:
+                QApplication.processEvents()
+            self._restore_list_scroll(scroll)
+        finally:
+            self._log_recursion_guard = reentrant
+
         # 2. 输出到终端
         print(log_line, flush=True)
-        
+
         # 3. 写入日志文件
         if hasattr(self, "_log_file_handler") and self._log_file_handler:
             try:
@@ -3081,11 +3181,36 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
         *,
         loading: bool = False,
     ):
+        """增量刷新包列表：复用已有行控件，仅删除/新增变化的包。
+
+        避免全量 deleteLater() 产生 DeferredDelete 事件洪水，
+        防止 processEvents() 期间 C++ 层访问已删除控件导致 abort()。
+        """
+        if not hasattr(self, '_package_rows'):
+            self._package_rows: dict[str, QWidget] = {}
+
+        new_names = {name for name, _, _ in package_entries}
+
+        # ---- 1. 删除不再存在的行 ----
+        for name in list(self._package_rows.keys()):
+            if name not in new_names:
+                self._package_rows.pop(name).deleteLater()
+
+        # ---- 2. 清空 layout，但保留复用行 ----
         while self.list_layout.count():
-            child = self.list_layout.takeAt(0)
-            w = child.widget()
-            if w:
-                w.deleteLater()
+            item = self.list_layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                # 仅保留 _package_rows 中已有的行控件，其余（分隔线、节标题）全部删除
+                is_known_row = any(w is row for row in self._package_rows.values())
+                if not is_known_row:
+                    w.deleteLater()
+
+        # ---- 3. 保存旧跟踪引用，准备新结构 ----
+        old_labels = dict(self.package_status_labels)
+        old_buttons = dict(self.package_row_buttons)
+        old_merge: dict[str, QPushButton] = dict(self.package_merge_buttons)
+
         self.row_buttons = []
         self.package_row_buttons = {}
         self.package_status_labels = {}
@@ -3093,178 +3218,237 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
         self.package_merge_buttons = {}
         self.package_refresh_buttons = {}
         self.package_entries = package_entries
+
         remote_section_started = False
 
         for pkg_name, pkg_dir, remote_only in package_entries:
+            # --- 远端分隔线 ---
             if remote_only and not remote_section_started:
                 remote_section_started = True
                 section = QLabel("── 仅远端（本地无） ──")
                 section.setStyleSheet("font-size: 12px; color: #9aa0a6; padding: 4px 0px;")
                 self.list_layout.addWidget(section)
-                sep = QFrame()
-                sep.setFrameShape(QFrame.HLine)
-                sep.setFrameShadow(QFrame.Plain)
-                sep.setFixedHeight(2)
-                sep.setStyleSheet("color: #5a5a62; margin: 0px; padding: 0px;")
-                self.list_layout.addWidget(sep)
+                sep_hdr = QFrame()
+                sep_hdr.setFrameShape(QFrame.HLine)
+                sep_hdr.setFrameShadow(QFrame.Plain)
+                sep_hdr.setFixedHeight(2)
+                sep_hdr.setStyleSheet("color: #5a5a62; margin: 0px; padding: 0px;")
+                self.list_layout.addWidget(sep_hdr)
 
-            row = QWidget()
+            # --- 复用或新建行 ---
+            reusing = pkg_name in self._package_rows
 
-            def _show_pkg_context_menu(pos, *, n=pkg_name, d=pkg_dir, ro=remote_only, w=row):
-                self._show_package_row_context_menu(n, d, ro, w.mapToGlobal(pos))
+            if reusing:
+                # ★ 复用已有行：不删除、不重建，仅更新 label 文本
+                row = self._package_rows[pkg_name]
+                label = old_labels.get(pkg_name)
+                buttons = old_buttons.get(pkg_name, {})
+                merge_btn = old_merge.get(pkg_name)
+            else:
+                # ★ 创建新行
+                row = QWidget()
+                self._package_rows[pkg_name] = row
 
-            row.setContextMenuPolicy(Qt.CustomContextMenu)
-            row.customContextMenuRequested.connect(_show_pkg_context_menu)
-            row_lay = QHBoxLayout(row)
-            row_lay.setContentsMargins(1, 0, 1, 0)
-            row_lay.setSpacing(4)
+                def _show_pkg_context_menu(
+                    pos, *, n=pkg_name, d=pkg_dir, ro=remote_only, w=row
+                ):
+                    self._show_package_row_context_menu(n, d, ro, w.mapToGlobal(pos))
 
+                row.setContextMenuPolicy(Qt.CustomContextMenu)
+                row.customContextMenuRequested.connect(_show_pkg_context_menu)
+                row_lay = QHBoxLayout(row)
+                row_lay.setContentsMargins(1, 0, 1, 0)
+                row_lay.setSpacing(4)
+
+                label = QLabel()
+                label.setMinimumWidth(200)
+                label.setContextMenuPolicy(Qt.CustomContextMenu)
+                label.customContextMenuRequested.connect(
+                    lambda pos, w=label, fn=_show_pkg_context_menu: fn(pos, w=w)
+                )
+                row_lay.addWidget(label, 1)
+
+                row_busy = loading and self._package_refresh_running
+
+                # 上传
+                btn_up = QPushButton("上传")
+                btn_up.setFocusPolicy(Qt.NoFocus)
+                btn_up.setProperty("class", "row-btn")
+                btn_up.setMinimumHeight(20)
+                btn_up.setMaximumWidth(58)
+                if remote_only:
+                    btn_up.setEnabled(False)
+                    btn_up.setToolTip("本地尚无此仓库，请先下载")
+                else:
+                    btn_up.clicked.connect(
+                        lambda _=False, p=pkg_dir: self.upload_one(p)
+                    )
+                if row_busy:
+                    btn_up.setEnabled(False)
+                btn_up.setContextMenuPolicy(Qt.CustomContextMenu)
+                btn_up.customContextMenuRequested.connect(
+                    lambda pos, w=btn_up, fn=_show_pkg_context_menu: fn(pos, w=w)
+                )
+                row_lay.addWidget(btn_up)
+                self.row_buttons.append(btn_up)
+
+                # 下载
+                btn_down = QPushButton("下载")
+                btn_down.setFocusPolicy(Qt.NoFocus)
+                btn_down.setProperty("class", "row-btn")
+                btn_down.setMinimumHeight(20)
+                btn_down.setMaximumWidth(58)
+                btn_down.clicked.connect(
+                    lambda _=False, p=pkg_dir: self.download_one(p)
+                )
+                if row_busy:
+                    btn_down.setEnabled(False)
+                btn_down.setContextMenuPolicy(Qt.CustomContextMenu)
+                btn_down.customContextMenuRequested.connect(
+                    lambda pos, w=btn_down, fn=_show_pkg_context_menu: fn(pos, w=w)
+                )
+                row_lay.addWidget(btn_down)
+                self.row_buttons.append(btn_down)
+
+                # 删本地
+                local_exists = pkg_dir.exists()
+                btn_del_local = QPushButton("删本地")
+                btn_del_local.setFocusPolicy(Qt.NoFocus)
+                btn_del_local.setProperty("class", "row-btn")
+                btn_del_local.setMinimumHeight(20)
+                btn_del_local.setMaximumWidth(58)
+                if remote_only or not local_exists:
+                    btn_del_local.setEnabled(False)
+                    btn_del_local.setToolTip("本地目录不存在")
+                else:
+                    btn_del_local.setToolTip("永久删除本地目录")
+                    btn_del_local.clicked.connect(
+                        lambda _=False, p=pkg_dir: self.delete_local_one(p)
+                    )
+                if row_busy:
+                    btn_del_local.setEnabled(False)
+                btn_del_local.setContextMenuPolicy(Qt.CustomContextMenu)
+                btn_del_local.customContextMenuRequested.connect(
+                    lambda pos, w=btn_del_local, fn=_show_pkg_context_menu: fn(pos, w=w)
+                )
+                row_lay.addWidget(btn_del_local)
+                self.row_buttons.append(btn_del_local)
+
+                # 删远端
+                btn_del_remote = QPushButton("删远端")
+                btn_del_remote.setFocusPolicy(Qt.NoFocus)
+                btn_del_remote.setProperty("class", "row-btn")
+                btn_del_remote.setMinimumHeight(20)
+                btn_del_remote.setMaximumWidth(58)
+                btn_del_remote.setToolTip("永久删除 GitHub 仓库")
+                btn_del_remote.clicked.connect(
+                    lambda _=False, p=pkg_dir: self.delete_remote_one(p)
+                )
+                if row_busy:
+                    btn_del_remote.setEnabled(False)
+                btn_del_remote.setContextMenuPolicy(Qt.CustomContextMenu)
+                btn_del_remote.customContextMenuRequested.connect(
+                    lambda pos, w=btn_del_remote, fn=_show_pkg_context_menu: fn(
+                        pos, w=w
+                    )
+                )
+                row_lay.addWidget(btn_del_remote)
+                self.row_buttons.append(btn_del_remote)
+
+                # 刷新
+                btn_refresh = QPushButton("刷新")
+                btn_refresh.setFocusPolicy(Qt.NoFocus)
+                btn_refresh.setProperty("class", "refresh-btn")
+                btn_refresh.setMinimumHeight(20)
+                btn_refresh.setMaximumWidth(46)
+                btn_refresh.setToolTip("刷新此包的 git 状态")
+                if remote_only:
+                    btn_refresh.setEnabled(False)
+                else:
+                    btn_refresh.clicked.connect(
+                        lambda _=False, n=pkg_name, p=pkg_dir: (
+                            self._update_one_package_status(n, p)
+                        )
+                    )
+                if row_busy:
+                    btn_refresh.setEnabled(False)
+                btn_refresh.setContextMenuPolicy(Qt.CustomContextMenu)
+                btn_refresh.customContextMenuRequested.connect(
+                    lambda pos, w=btn_refresh, fn=_show_pkg_context_menu: fn(
+                        pos, w=w
+                    )
+                )
+                row_lay.addWidget(btn_refresh)
+                self.row_buttons.append(btn_refresh)
+                if not remote_only:
+                    self.package_refresh_buttons[pkg_name] = btn_refresh
+
+                # 网页
+                btn_web = QPushButton("网页")
+                btn_web.setFocusPolicy(Qt.NoFocus)
+                btn_web.setProperty("class", "row-btn")
+                btn_web.setMinimumHeight(20)
+                btn_web.setMaximumWidth(46)
+                owner = (
+                    self.owner_edit.text().strip() if self.owner_edit else ""
+                ) or "Lugwit123"
+                btn_web.setToolTip(
+                    f"在浏览器中打开 https://github.com/{owner}/{pkg_name}"
+                )
+                btn_web.clicked.connect(
+                    lambda _=False, n=pkg_name: self._open_package_in_browser(n)
+                )
+                btn_web.setContextMenuPolicy(Qt.CustomContextMenu)
+                btn_web.customContextMenuRequested.connect(
+                    lambda pos, w=btn_web, fn=_show_pkg_context_menu: fn(pos, w=w)
+                )
+                row_lay.addWidget(btn_web)
+                self.row_buttons.append(btn_web)
+
+                buttons = {
+                    "upload": btn_up,
+                    "download": btn_down,
+                    "delete_local": btn_del_local,
+                    "delete_remote": btn_del_remote,
+                    "refresh": btn_refresh,
+                    "web": btn_web,
+                }
+                merge_btn = None
+
+            # --- 更新 label 文字和样式（新建与复用都需要）---
             if remote_only:
-                status_text = " [仅远端]"
-                label = QLabel(f"{pkg_name}{status_text}")
+                label.setText(f"{pkg_name} [仅远端]")
                 label.setStyleSheet("font-size: 12px;")
             elif loading and pkg_name not in status_map:
-                label = QLabel(f"{pkg_name} [扫描中…]")
+                label.setText(f"{pkg_name} [扫描中…]")
                 label.setStyleSheet("font-size: 12px; color: #9aa0a6;")
             else:
-                counts, sync, err = status_map.get(pkg_name, ({}, {"ahead": 0, "behind": 0}, ""))
+                counts, sync, err = status_map.get(
+                    pkg_name, ({}, {"ahead": 0, "behind": 0}, "")
+                )
                 status_text = self._format_package_status_suffix(counts, err, sync)
-                label = QLabel(f"{pkg_name}{status_text}")
+                label.setText(f"{pkg_name}{status_text}")
                 self._style_package_status_label(label, sync, counts)
                 if not err:
                     self.package_sync_map[pkg_name] = sync
-            label.setMinimumWidth(200)
-            label.setContextMenuPolicy(Qt.CustomContextMenu)
-            label.customContextMenuRequested.connect(
-                lambda pos, w=label, fn=_show_pkg_context_menu: fn(pos, w=w)
-            )
-            row_lay.addWidget(label, 1)
+
+            # --- 收集复用行的按钮到新的跟踪结构 ---
+            if reusing:
+                btns = old_buttons.get(pkg_name, {})
+                for key, btn in btns.items():
+                    if btn not in self.row_buttons:
+                        self.row_buttons.append(btn)
+                if not remote_only and "refresh" in btns:
+                    self.package_refresh_buttons[pkg_name] = btns["refresh"]
+                buttons = btns
+
+            # --- 记录跟踪结构 ---
             self.package_status_labels[pkg_name] = label
+            self.package_row_buttons[pkg_name] = buttons
+            if merge_btn is not None:
+                self.package_merge_buttons[pkg_name] = merge_btn
 
-            row_busy = loading and self._package_refresh_running
-
-            btn_up = QPushButton("上传")
-            btn_up.setFocusPolicy(Qt.NoFocus)
-            btn_up.setProperty("class", "row-btn")
-            btn_up.setMinimumHeight(20)
-            btn_up.setMaximumWidth(58)
-            if remote_only:
-                btn_up.setEnabled(False)
-                btn_up.setToolTip("本地尚无此仓库，请先下载")
-            else:
-                btn_up.clicked.connect(lambda _=False, p=pkg_dir: self.upload_one(p))
-            if row_busy:
-                btn_up.setEnabled(False)
-            btn_up.setContextMenuPolicy(Qt.CustomContextMenu)
-            btn_up.customContextMenuRequested.connect(
-                lambda pos, w=btn_up, fn=_show_pkg_context_menu: fn(pos, w=w)
-            )
-            row_lay.addWidget(btn_up)
-            self.row_buttons.append(btn_up)
-
-            btn_down = QPushButton("下载")
-            btn_down.setFocusPolicy(Qt.NoFocus)
-            btn_down.setProperty("class", "row-btn")
-            btn_down.setMinimumHeight(20)
-            btn_down.setMaximumWidth(58)
-            btn_down.clicked.connect(lambda _=False, p=pkg_dir: self.download_one(p))
-            if row_busy:
-                btn_down.setEnabled(False)
-            btn_down.setContextMenuPolicy(Qt.CustomContextMenu)
-            btn_down.customContextMenuRequested.connect(
-                lambda pos, w=btn_down, fn=_show_pkg_context_menu: fn(pos, w=w)
-            )
-            row_lay.addWidget(btn_down)
-            self.row_buttons.append(btn_down)
-
-            # 已移除单独的「AI合并」按钮：合并能力并入「下载」流程中处理。
-
-            local_exists = pkg_dir.exists()
-            btn_del_local = QPushButton("删本地")
-            btn_del_local.setFocusPolicy(Qt.NoFocus)
-            btn_del_local.setProperty("class", "row-btn")
-            btn_del_local.setMinimumHeight(20)
-            btn_del_local.setMaximumWidth(58)
-            if remote_only or not local_exists:
-                btn_del_local.setEnabled(False)
-                btn_del_local.setToolTip("本地目录不存在")
-            else:
-                btn_del_local.setToolTip("永久删除本地目录")
-                btn_del_local.clicked.connect(lambda _=False, p=pkg_dir: self.delete_local_one(p))
-            if row_busy:
-                btn_del_local.setEnabled(False)
-            btn_del_local.setContextMenuPolicy(Qt.CustomContextMenu)
-            btn_del_local.customContextMenuRequested.connect(
-                lambda pos, w=btn_del_local, fn=_show_pkg_context_menu: fn(pos, w=w)
-            )
-            row_lay.addWidget(btn_del_local)
-            self.row_buttons.append(btn_del_local)
-
-            btn_del_remote = QPushButton("删远端")
-            btn_del_remote.setFocusPolicy(Qt.NoFocus)
-            btn_del_remote.setProperty("class", "row-btn")
-            btn_del_remote.setMinimumHeight(20)
-            btn_del_remote.setMaximumWidth(58)
-            btn_del_remote.setToolTip("永久删除 GitHub 仓库")
-            btn_del_remote.clicked.connect(lambda _=False, p=pkg_dir: self.delete_remote_one(p))
-            if row_busy:
-                btn_del_remote.setEnabled(False)
-            btn_del_remote.setContextMenuPolicy(Qt.CustomContextMenu)
-            btn_del_remote.customContextMenuRequested.connect(
-                lambda pos, w=btn_del_remote, fn=_show_pkg_context_menu: fn(pos, w=w)
-            )
-            row_lay.addWidget(btn_del_remote)
-            self.row_buttons.append(btn_del_remote)
-
-            btn_refresh = QPushButton("刷新")
-            btn_refresh.setFocusPolicy(Qt.NoFocus)
-            btn_refresh.setProperty("class", "refresh-btn")
-            btn_refresh.setMinimumHeight(20)
-            btn_refresh.setMaximumWidth(46)
-            btn_refresh.setToolTip("刷新此包的 git 状态")
-            if remote_only:
-                btn_refresh.setEnabled(False)
-            else:
-                btn_refresh.clicked.connect(
-                    lambda _=False, n=pkg_name, p=pkg_dir: self._update_one_package_status(n, p)
-                )
-            if row_busy:
-                btn_refresh.setEnabled(False)
-            btn_refresh.setContextMenuPolicy(Qt.CustomContextMenu)
-            btn_refresh.customContextMenuRequested.connect(
-                lambda pos, w=btn_refresh, fn=_show_pkg_context_menu: fn(pos, w=w)
-            )
-            row_lay.addWidget(btn_refresh)
-            self.row_buttons.append(btn_refresh)
-            if not remote_only:
-                self.package_refresh_buttons[pkg_name] = btn_refresh
-
-            btn_web = QPushButton("网页")
-            btn_web.setFocusPolicy(Qt.NoFocus)
-            btn_web.setProperty("class", "row-btn")
-            btn_web.setMinimumHeight(20)
-            btn_web.setMaximumWidth(46)
-            owner = (self.owner_edit.text().strip() if self.owner_edit else "") or "Lugwit123"
-            btn_web.setToolTip(f"在浏览器中打开 https://github.com/{owner}/{pkg_name}")
-            btn_web.clicked.connect(
-                lambda _=False, n=pkg_name: self._open_package_in_browser(n)
-            )
-            btn_web.setContextMenuPolicy(Qt.CustomContextMenu)
-            btn_web.customContextMenuRequested.connect(
-                lambda pos, w=btn_web, fn=_show_pkg_context_menu: fn(pos, w=w)
-            )
-            row_lay.addWidget(btn_web)
-            self.row_buttons.append(btn_web)
-
-            self.package_row_buttons[pkg_name] = {
-                "upload": btn_up,
-                "download": btn_down,
-                "delete_local": btn_del_local,
-                "delete_remote": btn_del_remote,
-                "refresh": btn_refresh,
-                "web": btn_web,
-            }
-
+            # --- 添加到 layout（分隔线每次重建）---
             self.list_layout.addWidget(row)
             sep = QFrame()
             sep.setFrameShape(QFrame.HLine)
@@ -5031,7 +5215,19 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
         return content
 
 
+def _fault_log_path() -> Path:
+    """faulthandler 崩溃日志路径，便于排查 PySide6 / Qt 原生层直接退出。"""
+    log_dir = Path(os.environ.get("TEMP", ".")) / "l_repo_sync_gui" / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    return log_dir / f"fault_{datetime.datetime.now():%Y-%m-%d}.log"
+
+
 def main():
+    # ---- 启动阶段诊断日志 ----
+    _write_runtime_log("[STARTUP] l_repo_sync_gui starting", echo=True)
+    _write_runtime_log(f"[STARTUP] Python: {sys.executable}", echo=True)
+    _write_runtime_log(f"[STARTUP] argv: {sys.argv}", echo=True)
+
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--mode", choices=["server", "client"], default="")
     parser.add_argument(
@@ -5043,6 +5239,24 @@ def main():
     mode_map = {"server": "Server", "client": "Client"}
 
     _set_windows_app_id()
+
+    # ---- faulthandler：捕获 C++ 层 segfault 崩溃堆栈 ----
+    try:
+        fault_fh = _fault_log_path().open("a", encoding="utf-8")
+        fault_fh.write(
+            f"\n=== {datetime.datetime.now():%Y-%m-%d %H:%M:%S} "
+            f"l_repo_sync_gui started (pid={os.getpid()}) ===\n"
+        )
+        fault_fh.flush()
+        faulthandler.enable(file=fault_fh, all_threads=True)
+        _write_runtime_log(
+            f"[STARTUP] faulthandler enabled -> {_fault_log_path()}", echo=True
+        )
+    except Exception:
+        _write_runtime_log(
+            "[STARTUP][WARN] faulthandler init failed:\n" + traceback.format_exc(),
+            echo=True,
+        )
 
     def _stall_on_trigger(info):
         """卡顿回调：同时写 stderr 和日志文件（不依赖 GUI）。"""
@@ -5063,35 +5277,46 @@ def main():
     # 先创建日志文件，供 stall 回调写入
     _stall_log_fh = None
     try:
-        _log_dir = Path(os.environ.get("TEMP", ".")) / "l_repo_sync_gui" / "logs"
-        _log_dir.mkdir(parents=True, exist_ok=True)
-        _today = datetime.datetime.now().strftime("%Y-%m-%d")
-        _stall_log_fh = open(_log_dir / f"sync_{_today}.log", "a", encoding="utf-8")
+        _stall_log_fh = _runtime_log_path().open("a", encoding="utf-8")
     except Exception:
         pass
 
-    lprint.stall_monitor_start(
-        threshold_s=5,
-        poll_interval=1,
-        monitor_all_threads=True,
-        on_trigger=_stall_on_trigger,
-    )
-    print("[stall_monitor] 已启动 (threshold=5s, poll=1s)", file=sys.stderr, flush=True)
+    try:
+        lprint.stall_monitor_start(
+            threshold_s=5,
+            poll_interval=1,
+            monitor_all_threads=True,
+            on_trigger=_stall_on_trigger,
+        )
+    except Exception:
+        _write_runtime_log("[WARN] stall_monitor 启动失败:\n" + traceback.format_exc())
 
+    _write_runtime_log("[STARTUP] creating QApplication", echo=True)
     app = QApplication(sys.argv)
+    app.setQuitOnLastWindowClosed(False)
 
     if APP_ICON_FILE.exists():
         app.setWindowIcon(QIcon(str(APP_ICON_FILE)))
     launch_command = " ".join(shlex.quote(part) for part in sys.argv)
+
+    _write_runtime_log("[STARTUP] creating RepoSyncWindow", echo=True)
     win = RepoSyncWindow(
         mode_map.get(args.mode) or None,
         refresh_status_on_start=args.refresh_status,
         launch_command=launch_command,
     )
 
+    _write_runtime_log("[STARTUP] calling win.show()", echo=True)
     win.show()
+    _write_runtime_log("[STARTUP] entering app.exec()", echo=True)
     sys.exit(app.exec())
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except SystemExit:
+        raise
+    except BaseException:
+        _write_runtime_log("[FATAL] l_repo_sync_gui crashed:\n" + traceback.format_exc(), echo=True)
+        raise
