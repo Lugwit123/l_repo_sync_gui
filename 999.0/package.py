@@ -9,6 +9,7 @@ requires = [
     "python-3.12+<3.13",
     "pyside6",
     "l_qt_wgt_lib",
+    "l_qframelesswindow",
     "pytracemp",
     "gitpython",
 ]

@@ -63,6 +63,7 @@ from PySide6.QtWidgets import (
 )
 from l_qt_wgt_lib.smart_widget import CodeEditorWidget, LogCodeHighlighter
 from l_qt_wgt_lib.tray_window import TrayAwareMixin
+from l_qframelesswindow import L_FramelessMainWindow
 from pytracemp import lprint, LPrint
 
 try:
@@ -407,7 +408,7 @@ class _DiffHighlighter(QSyntaxHighlighter):
             self.setFormat(0, len(text), self._fmt_del)
 
 
-class RepoSyncWindow(TrayAwareMixin, QMainWindow):
+class RepoSyncWindow(TrayAwareMixin, L_FramelessMainWindow):
     def __init__(
         self,
         launch_mode: str | None = None,
@@ -415,7 +416,8 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
         refresh_status_on_start: bool = False,
         launch_command: str | None = None,
     ):
-        super().__init__()
+        # 参考 l_notepad：改用 L_FramelessMainWindow 无边框外壳 + 自定义标题栏
+        super().__init__(vertical_threshold=900)
         self.rez_source = _find_rez_source_root()
         self._refresh_status_on_start = refresh_status_on_start
         title_parts = ["Rez Package Repo Sync"]
@@ -423,6 +425,14 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
             title_parts.append(launch_mode)
         self._launch_command = launch_command or ""
         self.setWindowTitle(" - ".join(title_parts))
+        # 无边框标题栏：左侧标题文本 + 隐藏默认图标
+        self._title_label = QLabel(" - ".join(title_parts))
+        self._title_label.setStyleSheet(
+            "color: #E8EAED; font-weight: 600; font-size: 12px; padding-left: 6px;")
+        self._title_label.setAlignment(
+            Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
+        self.setStartWidgets([self._title_label])
+        self.hideTitleBarIcon()
         self.resize(1280, 820)
         self.setMinimumSize(1100, 700)
         # 防重入标志：防止 _run_blocking_with_events 嵌套调用
@@ -453,6 +463,9 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
         self.debug_start_pkg: QCheckBox | None = None
         self._package_refresh_token = 0
         self._package_refresh_running = False
+        # 上传（含批量）进行中标志：为 True 时禁止启动任何后台包状态刷新 worker，
+        # 避免后台 GitPython 与上传的 git 子进程并发 spawn 触发 C++ abort()。
+        self._batch_upload_active = False
         self._last_list_scan_status = True
         self._package_alias_cache: dict[str, list[str]] = {}
         self._package_refresh_bridge = _PackageRefreshBridge()
@@ -505,7 +518,7 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
         if central is None:
             raise RuntimeError(
                 f"QUiLoader failed to load UI: {ui_path}; error={loader.errorString()}")
-        self.setCentralWidget(central)
+        self.setContentWidget(central)  # L_FramelessMainWindow 外壳：内容放入 contentLayout
 
         # 绑定 .ui 中通过 objectName 定义的控件
         self.owner_edit = central.findChild(QLineEdit, "owner_edit")
@@ -2621,6 +2634,9 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
         repo = self._repo(pkg_dir)
         if repo is None:
             return False, {}, empty_sync, "非git仓库"
+        # 持全局 git 锁：本函数在后台 worker 中通过 GitPython(repo.git.*) spawn git
+        # 子进程，必须与主线程上传的 git 子进程串行，避免并发 spawn 触发 C++ abort()。
+        git_helper.GIT_LOCK.acquire()
         try:
             if fetch_remote:
                 try:
@@ -2658,6 +2674,8 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
             return True, counts, sync, ""
         except Exception as exc:
             return False, {}, empty_sync, f"扫描失败: {exc}"
+        finally:
+            git_helper.GIT_LOCK.release()
 
     @staticmethod
     def _format_package_status_suffix(
@@ -2883,6 +2901,9 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
 
     def _update_one_package_status(self, pkg_name: str, pkg_dir: Path):
         """后台线程刷新单包状态，完成后通过信号回调更新 UI。"""
+        # 上传（批量）进行中：跳过后台刷新，避免与上传的 git 子进程并发 spawn。
+        if self._batch_upload_active:
+            return
         refresh_btn = self.package_refresh_buttons.get(pkg_name)
         if refresh_btn is not None:
             refresh_btn.setEnabled(False)
@@ -2925,6 +2946,8 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
             QMessageBox.warning(self, "打开浏览器失败", str(exc))
 
     def refresh_package_status(self):
+        if self._batch_upload_active:
+            return
         if not self.package_entries:
             self._start_package_list_refresh(scan_status=True)
             return
@@ -2962,6 +2985,8 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
         self._start_package_list_refresh(scan_status=True)
 
     def _start_package_list_refresh(self, *, scan_status: bool = True):
+        if self._batch_upload_active:
+            return
         if self._package_refresh_running:
             return
         self._package_refresh_token += 1
@@ -5211,10 +5236,15 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
     def upload_all(self):
         if not self._check_tools():
             return
-        for _, pkg_dir, remote_only in self._package_entries():
-            if remote_only:
-                continue
-            self.upload_one(pkg_dir)
+        self._batch_upload_active = True
+        try:
+            for _, pkg_dir, remote_only in self._package_entries():
+                if remote_only:
+                    continue
+                self.upload_one(pkg_dir)
+        finally:
+            self._batch_upload_active = False
+            self.refresh_package_status()
 
     def upload_selected(self):
         """上传列表中已勾选的本地包（逐个调用 upload_one）。"""
@@ -5232,8 +5262,13 @@ class RepoSyncWindow(TrayAwareMixin, QMainWindow):
                 self, "上传选中", "未勾选任何可上传的包。\n请在左侧列表勾选要上传的包。")
             return
         self._log(f"[info] 批量上传选中：{len(selected)} 个包")
-        for pkg_dir in selected:
-            self.upload_one(pkg_dir)
+        self._batch_upload_active = True
+        try:
+            for pkg_dir in selected:
+                self.upload_one(pkg_dir)
+        finally:
+            self._batch_upload_active = False
+            self.refresh_package_status()
 
     def download_all(self):
         if not self._check_tools():

@@ -6,12 +6,22 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 from git import Git, Repo
 from git.exc import GitCommandError, GitCommandNotFound, InvalidGitRepositoryError
 
 GIT_HTTP_CONNECT_TIMEOUT_SEC = 5
+
+# 全局 git 串行化锁（可重入）：确保任意时刻只有一个线程在 spawn git 子进程。
+# 历史崩溃根因：上传（主线程 git 子进程 / GitPython）与后台包状态刷新
+# (_scan_package_status 的 GitPython 调用) 并发 spawn git 子进程，叠加 Qt 跨线程
+# 交互，触发 C++ 层 abort()（Fatal Python error: Aborted）。所有会启动 git 子进程
+# 的路径统一持此锁即可消除并发诱因。RLock 允许同线程重入（如 commit 内连续两次
+# execute_git、clone_from 调 execute_git），不会自死锁。
+# main.py 中直接使用 GitPython（repo.git.*）的地方也应 `with git_helper.GIT_LOCK:`。
+GIT_LOCK = threading.RLock()
 
 
 def _on_windows() -> bool:
@@ -66,7 +76,8 @@ def _format_git_error(exc: GitCommandError) -> str:
 
 def check_git_available() -> tuple[bool, str]:
     try:
-        version = _git_instance().version()
+        with GIT_LOCK:
+            version = _git_instance().version()
         return True, (version or "").strip()
     except GitCommandNotFound as exc:
         return False, f"GitPython 无法调用 git（请确认 Git 在 PATH 中）: {exc}"
@@ -96,17 +107,18 @@ def execute_git(
         exec_args = ["git"] + exec_args
     exec_args = [exec_args[0]] + git_multi_options(repo_path) + exec_args[1:]
     try:
-        proc = subprocess.run(
-            exec_args,
-            cwd=str(cwd) if cwd else None,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            env=run_env,
-            timeout=timeout if timeout and timeout > 0 else None,
-            check=False,
-        )
+        with GIT_LOCK:
+            proc = subprocess.run(
+                exec_args,
+                cwd=str(cwd) if cwd else None,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                env=run_env,
+                timeout=timeout if timeout and timeout > 0 else None,
+                check=False,
+            )
         out = (proc.stdout or "").strip()
         err = (proc.stderr or "").strip()
         if proc.returncode != 0:
@@ -160,11 +172,12 @@ def open_repo(pkg_dir: Path) -> Repo | None:
 
 def init_repo(pkg_dir: Path, branch: str = "main") -> tuple[bool, str]:
     try:
-        Repo.init(str(pkg_dir), initial_branch=branch)
-        repo = open_repo(pkg_dir)
-        if repo is not None:
-            with repo.config_writer() as cw:
-                cw.set_value("core", "longpaths", True)
+        with GIT_LOCK:
+            Repo.init(str(pkg_dir), initial_branch=branch)
+            repo = open_repo(pkg_dir)
+            if repo is not None:
+                with repo.config_writer() as cw:
+                    cw.set_value("core", "longpaths", True)
         return True, ""
     except Exception as exc:
         return False, str(exc)
@@ -282,15 +295,16 @@ def cat_file_batch_check(pkg_dir: Path, stdin_text: str) -> tuple[bool, str]:
         return True, ""
     git_cmd = ["git", *git_multi_options(pkg_dir), "cat-file", "--batch-check=%(objecttype) %(objectname) %(objectsize) %(rest)"]
     try:
-        proc = subprocess.run(
-            git_cmd,
-            cwd=str(pkg_dir),
-            input=stdin_text.encode("utf-8"),
-            capture_output=True,
-            env=_run_env(),
-            timeout=120,
-            check=False,
-        )
+        with GIT_LOCK:
+            proc = subprocess.run(
+                git_cmd,
+                cwd=str(pkg_dir),
+                input=stdin_text.encode("utf-8"),
+                capture_output=True,
+                env=_run_env(),
+                timeout=120,
+                check=False,
+            )
         out = (proc.stdout or b"").decode("utf-8", errors="replace").strip()
         err = (proc.stderr or b"").decode("utf-8", errors="replace").strip()
         if proc.returncode != 0:
