@@ -31,7 +31,7 @@ except ImportError:
     winreg = None
 from pathlib import Path
 
-from PySide6.QtCore import QEventLoop, QFile, QObject, QRunnable, Qt, QThread, QThreadPool, QTimer, Signal
+from PySide6.QtCore import QEvent, QEventLoop, QFile, QObject, QRunnable, Qt, QThread, QThreadPool, QTimer, Signal
 from PySide6.QtGui import QAction, QColor, QIcon, QSyntaxHighlighter, QTextCharFormat
 from PySide6.QtUiTools import QUiLoader
 from PySide6.QtWidgets import (
@@ -111,6 +111,10 @@ PACKAGE_EXTRA_IGNORE: dict[str, list[str]] = {
 
 GITHUB_FILE_WARN_BYTES = 50 * 1024 * 1024
 GITHUB_FILE_LIMIT_BYTES = 100 * 1024 * 1024
+
+# 每日 0 点自动上传：排除名单 + 勾选配置持久化文件
+AUTO_UPLOAD_EXCLUDE = {"l_WChat"}
+AUTO_UPLOAD_FILE = Path.home() / ".lugwit" / "l_repo_sync_gui" / "auto_upload.json"
 
 SKIP_DIRS = {"repo_tools"}
 PROTECTED_LOCAL_DELETE = {"l_repo_sync_gui"}
@@ -417,6 +421,10 @@ class RepoSyncWindow(TrayAwareMixin, L_FramelessMainWindow):
         launch_command: str | None = None,
     ):
         # 参考 l_notepad：改用 L_FramelessMainWindow 无边框外壳 + 自定义标题栏
+        # 包列表行 hover 高亮用的映射，必须在 super().__init__() 之前初始化，
+        # 因为无边框窗口加载 UI 时 eventFilter 会先被 Qt 回调。
+        self._row_pkg_map: dict[QWidget, str] = {}
+        self._row_hover_originals: dict[QWidget, dict[QLabel, str]] = {}
         super().__init__(vertical_threshold=900)
         self.rez_source = _find_rez_source_root()
         self._refresh_status_on_start = refresh_status_on_start
@@ -456,6 +464,9 @@ class RepoSyncWindow(TrayAwareMixin, L_FramelessMainWindow):
         self.package_refresh_buttons: dict[str, QPushButton] = {}
         # 每行勾选框：供「上传选中」批量上传使用（按包名跟踪，跨行复用保留）
         self.package_checkboxes: dict[str, QCheckBox] = {}
+        # 每日 0 点自动上传：勾选集合（持久化）+ 每行自动上传复选框跟踪
+        self._auto_upload_set: set[str] = self._load_auto_upload_set()
+        self.package_auto_chk: dict[str, QCheckBox] = {}
         self.btn_upload_selected: QPushButton | None = None
         self.btn_refresh_status: QPushButton | None = None
         self.btn_refresh_packages: QPushButton | None = None
@@ -490,6 +501,8 @@ class RepoSyncWindow(TrayAwareMixin, L_FramelessMainWindow):
             lambda: self._start_package_list_refresh(
                 scan_status=self._refresh_status_on_start),
         )
+        # 调度每日 0 点自动上传（延迟 5s，避免与启动流程抢占）
+        QTimer.singleShot(5000, self._schedule_midnight_auto_upload)
 
     def _load_style(self):
         qss_path = RESOURCES_DIR / "style.qss"
@@ -3335,6 +3348,41 @@ class RepoSyncWindow(TrayAwareMixin, L_FramelessMainWindow):
 
         menu.exec(global_pos)
 
+    def eventFilter(self, obj, event):
+        """包列表行 hover：鼠标悬停整行时，包名黄色高亮。"""
+        row_map = getattr(self, "_row_pkg_map", None)
+        if row_map and obj is not None and obj in row_map:
+            etype = event.type()
+            if etype == QEvent.HoverEnter:
+                layout = obj.layout()
+                if layout is not None:
+                    labels = [
+                        layout.itemAt(i).widget()
+                        for i in range(layout.count())
+                        if isinstance(layout.itemAt(i).widget(), QLabel)
+                    ]
+                    self._row_hover_originals[obj] = {
+                        lab: lab.styleSheet() for lab in labels
+                    }
+                    for lab in labels:
+                        lab.setStyleSheet(
+                            "font-size: 12px; color: #ffd700; font-weight: bold;"
+                        )
+            elif etype == QEvent.HoverLeave:
+                # 鼠标移到行内按钮/复选框上时也会触发 HoverLeave，
+                # 若位置仍在行内则不恢复，避免高亮闪烁。
+                pos = event.position().toPoint()
+                if obj.rect().contains(pos):
+                    return super().eventFilter(obj, event)
+                originals = self._row_hover_originals.pop(obj, {})
+                layout = obj.layout()
+                if layout is not None:
+                    for i in range(layout.count()):
+                        w = layout.itemAt(i).widget()
+                        if w is not None and w in originals:
+                            w.setStyleSheet(originals[w])
+        return super().eventFilter(obj, event)
+
     def _render_package_list(
         self,
         package_entries: list[tuple[str, Path, bool]],
@@ -3349,13 +3397,20 @@ class RepoSyncWindow(TrayAwareMixin, L_FramelessMainWindow):
         """
         if not hasattr(self, '_package_rows'):
             self._package_rows: dict[str, QWidget] = {}
+        if not hasattr(self, '_row_pkg_map'):
+            self._row_pkg_map: dict[QWidget, str] = {}
+        if not hasattr(self, '_row_hover_originals'):
+            self._row_hover_originals: dict[QWidget, dict[QLabel, str]] = {}
 
         new_names = {name for name, _, _ in package_entries}
 
         # ---- 1. 删除不再存在的行 ----
         for name in list(self._package_rows.keys()):
             if name not in new_names:
-                self._package_rows.pop(name).deleteLater()
+                row = self._package_rows.pop(name)
+                self._row_pkg_map.pop(row, None)
+                self._row_hover_originals.pop(row, None)
+                row.deleteLater()
 
         # ---- 2. 清空 layout，但保留复用行 ----
         while self.list_layout.count():
@@ -3373,6 +3428,7 @@ class RepoSyncWindow(TrayAwareMixin, L_FramelessMainWindow):
         old_buttons = dict(self.package_row_buttons)
         old_merge: dict[str, QPushButton] = dict(self.package_merge_buttons)
         old_checkboxes: dict[str, QCheckBox] = dict(self.package_checkboxes)
+        old_auto_chks: dict[str, QCheckBox] = dict(self.package_auto_chk)
 
         self.row_buttons = []
         self.package_row_buttons = {}
@@ -3381,6 +3437,7 @@ class RepoSyncWindow(TrayAwareMixin, L_FramelessMainWindow):
         self.package_merge_buttons = {}
         self.package_refresh_buttons = {}
         self.package_checkboxes = {}
+        self.package_auto_chk = {}
         self.package_entries = package_entries
 
         remote_section_started = False
@@ -3411,10 +3468,14 @@ class RepoSyncWindow(TrayAwareMixin, L_FramelessMainWindow):
                 buttons = old_buttons.get(pkg_name, {})
                 merge_btn = old_merge.get(pkg_name)
                 chk = old_checkboxes.get(pkg_name)
+                auto_chk = old_auto_chks.get(pkg_name)
             else:
                 # ★ 创建新行
                 row = QWidget()
                 self._package_rows[pkg_name] = row
+                row.setAttribute(Qt.WA_Hover, True)
+                row.installEventFilter(self)
+                self._row_pkg_map[row] = pkg_name
 
                 def _show_pkg_context_menu(
                     pos, *, n=pkg_name, d=pkg_dir, ro=remote_only, w=row
@@ -3425,8 +3486,8 @@ class RepoSyncWindow(TrayAwareMixin, L_FramelessMainWindow):
                 row.setContextMenuPolicy(Qt.CustomContextMenu)
                 row.customContextMenuRequested.connect(_show_pkg_context_menu)
                 row_lay = QHBoxLayout(row)
-                row_lay.setContentsMargins(1, 0, 1, 0)
-                row_lay.setSpacing(4)
+                row_lay.setContentsMargins(8, 0, 8, 0)
+                row_lay.setSpacing(12)
 
                 # 行首勾选框：供顶部「上传选中」批量上传（仅本地可上传的包）
                 if remote_only:
@@ -3434,12 +3495,28 @@ class RepoSyncWindow(TrayAwareMixin, L_FramelessMainWindow):
                 else:
                     chk = QCheckBox()
                     chk.setFocusPolicy(Qt.NoFocus)
-                    chk.setMaximumWidth(22)
+                    chk.setMaximumWidth(28)
                     chk.setToolTip("勾选后点顶部「上传选中」批量上传")
                     row_lay.addWidget(chk)
 
+                # 「自动上传」复选框：勾选后每天 0 点自动上传（排除名单不显示）
+                if remote_only or pkg_name in AUTO_UPLOAD_EXCLUDE:
+                    auto_chk = None
+                else:
+                    auto_chk = QCheckBox()
+                    auto_chk.setFocusPolicy(Qt.NoFocus)
+                    auto_chk.setMaximumWidth(26)
+                    auto_chk.setToolTip("每天 0 点自动上传此包")
+                    auto_chk.setChecked(pkg_name in self._auto_upload_set)
+                    auto_chk.toggled.connect(
+                        lambda checked, n=pkg_name: self._on_auto_upload_toggled(
+                            n, checked
+                        )
+                    )
+                    row_lay.addWidget(auto_chk)
+
                 label = QLabel()
-                label.setMinimumWidth(200)
+                label.setMinimumWidth(240)
                 label.setContextMenuPolicy(Qt.CustomContextMenu)
                 label.customContextMenuRequested.connect(
                     lambda pos, w=label, fn=_show_pkg_context_menu: fn(
@@ -3634,6 +3711,8 @@ class RepoSyncWindow(TrayAwareMixin, L_FramelessMainWindow):
                 self.package_merge_buttons[pkg_name] = merge_btn
             if chk is not None:
                 self.package_checkboxes[pkg_name] = chk
+            if auto_chk is not None:
+                self.package_auto_chk[pkg_name] = auto_chk
 
             # --- 添加到 layout（分隔线每次重建）---
             self.list_layout.addWidget(row)
@@ -4897,6 +4976,127 @@ class RepoSyncWindow(TrayAwareMixin, L_FramelessMainWindow):
             out.append("[远端将覆盖到的版本] 无上游分支，后续会回退到 origin/<当前分支>")
         return out
 
+    # ── 每日 0 点自动上传 ────────────────────────────────
+    @staticmethod
+    def _load_auto_upload_set() -> set[str]:
+        """加载自动上传勾选配置（包名集合，持久化到本地文件）。"""
+        try:
+            if AUTO_UPLOAD_FILE.exists():
+                data = json.loads(AUTO_UPLOAD_FILE.read_text(encoding="utf-8"))
+                if isinstance(data, list):
+                    return {str(n) for n in data}
+        except Exception as exc:  # noqa: BLE001
+            print(f"[auto] 加载自动上传配置失败: {exc}")
+        return set()
+
+    def _save_auto_upload_set(self) -> None:
+        try:
+            AUTO_UPLOAD_FILE.parent.mkdir(parents=True, exist_ok=True)
+            AUTO_UPLOAD_FILE.write_text(
+                json.dumps(sorted(self._auto_upload_set), ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"[auto] 保存自动上传配置失败: {exc}")
+
+    def _on_auto_upload_toggled(self, name: str, checked: bool) -> None:
+        if checked:
+            self._auto_upload_set.add(name)
+        else:
+            self._auto_upload_set.discard(name)
+        self._save_auto_upload_set()
+        self._log(f"[auto] {name} 自动上传: {'开启' if checked else '关闭'}")
+
+    def _schedule_midnight_auto_upload(self) -> None:
+        """调度下一个 0 点触发自动上传（每日重复）。"""
+        now = datetime.datetime.now()
+        nxt = (now + datetime.timedelta(days=1)).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        ms = max(1000, int((nxt - now).total_seconds() * 1000))
+        QTimer.singleShot(ms, self._on_midnight_auto_upload)
+        self._log(f"[auto] 已调度每日自动上传: {nxt:%Y-%m-%d %H:%M:%S}")
+
+    def _on_midnight_auto_upload(self) -> None:
+        """每日 0 点：对勾选的包执行无头自动上传。"""
+        self._log("[auto] ===== 每日 0 点自动上传开始 =====")
+        self._batch_upload_active = True
+        try:
+            names = sorted(self._auto_upload_set)
+            if not names:
+                self._log("[auto] 无勾选的包，跳过")
+                return
+            local_map = {name: path for name, path in self._local_package_entries()}
+            for name in names:
+                if name in AUTO_UPLOAD_EXCLUDE:
+                    self._log(f"[auto] {name} 在排除名单，跳过")
+                    continue
+                pkg_dir = local_map.get(name)
+                if pkg_dir is None or not (pkg_dir / ".git").is_dir():
+                    self._log(f"[auto] {name} 本地不存在或非 git 仓库，跳过")
+                    continue
+                self._auto_upload_one(pkg_dir)
+        finally:
+            self._batch_upload_active = False
+            self._log("[auto] ===== 每日 0 点自动上传结束 =====")
+            self._schedule_midnight_auto_upload()
+
+    def _auto_upload_one(self, pkg_dir: Path) -> None:
+        """无头自动上传单个包：add -A → commit → push（被拒则 force-with-lease）。
+
+        不弹任何对话框；所有结果写入日志。强制覆盖仅在被远端拒绝
+        （non-fast-forward）时发生，避免破坏他人提交。
+        """
+        pkg_name = pkg_dir.name
+        try:
+            self._log(f"[auto] 上传 {pkg_name} ...")
+            if not self._ensure_git_repo(pkg_dir):
+                return
+            self._ensure_gitignore(pkg_dir)
+            self._run(["git", "add", "-A"], cwd=pkg_dir)
+            ok_clean, _ = self._run(
+                ["git", "diff", "--cached", "--quiet"], cwd=pkg_dir
+            )
+            if ok_clean:
+                self._log(f"[auto] {pkg_name} 无变更，直接推送")
+            else:
+                commit_msg = (
+                    f"auto upload {pkg_name} "
+                    f"({datetime.datetime.now():%Y-%m-%d %H:%M})"
+                )
+                ok_commit, msg_commit, _ = self._run_blocking_with_events(
+                    git_helper.commit, pkg_dir, commit_msg
+                )
+                if ok_commit:
+                    self._log(f"[auto] {pkg_name} 已提交")
+                else:
+                    self._log(f"[auto] {pkg_name} commit 失败: {msg_commit}")
+                    return
+            branch = self._current_branch(pkg_dir)
+            ok_push, msg_push = self._run_blocking_with_events(
+                git_helper.push, pkg_dir, branch, set_upstream=True
+            )
+            if ok_push:
+                self._log(f"[auto] {pkg_name} ✓ 上传成功")
+                return
+            if self._is_non_fast_forward_error(msg_push):
+                self._log(f"[auto] {pkg_name} 被远端拒绝，尝试强制覆盖")
+                ok_force, msg_force = self._run_blocking_with_events(
+                    git_helper.push,
+                    pkg_dir,
+                    branch,
+                    set_upstream=True,
+                    force_with_lease=True,
+                )
+                if ok_force:
+                    self._log(f"[auto] {pkg_name} ✓ 强制上传成功")
+                else:
+                    self._log(f"[auto] {pkg_name} 强制上传失败: {msg_force}")
+            else:
+                self._log(f"[auto] {pkg_name} 上传失败: {msg_push}")
+        except Exception as exc:  # noqa: BLE001
+            self._log(f"[auto] {pkg_name} 上传异常: {exc}")
+
     def upload_one(self, pkg_dir: Path):
         owner = self.owner_edit.text().strip() or "Lugwit123"
         pkg_name = pkg_dir.name
@@ -5657,6 +5857,13 @@ def main():
     _write_runtime_log("[STARTUP] creating QApplication", echo=True)
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
+
+    # 线程池 worker 线程空闲后驻留不退出：默认 30s 过期会导致线程销毁其
+    # Qt 线程数据（QThreadStorage），若恰逢主线程处于嵌套事件循环（上传确认
+    # 对话框 dlg.exec() 等）会触发 C++ 层
+    # "QThreadStorage: entry destroyed before end of thread" → abort()。
+    # 设为 -1（永不过期）让线程常驻，线程数据不销毁，杜绝该崩溃路径。
+    QThreadPool.globalInstance().setExpiryTimeout(-1)
 
     if APP_ICON_FILE.exists():
         app.setWindowIcon(QIcon(str(APP_ICON_FILE)))
