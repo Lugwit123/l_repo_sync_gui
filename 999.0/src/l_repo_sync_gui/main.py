@@ -4682,7 +4682,9 @@ class RepoSyncWindow(TrayAwareMixin, L_FramelessMainWindow):
                 in_section = False
                 continue
             if s.startswith("["):
-                in_section = s in file_sections
+                # 「将提交的删除」标题带后缀说明（如 "本地已删除 1 个文件..."），
+                # 用前缀匹配；其余标题精确匹配，避免把 diff 区域误判为文件清单。
+                in_section = s in file_sections or s.startswith("[将提交的删除]")
                 continue
             if not in_section or s.startswith("("):
                 continue
