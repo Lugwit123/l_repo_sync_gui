@@ -32,7 +32,7 @@ except ImportError:
 from pathlib import Path
 
 from PySide6.QtCore import QEvent, QEventLoop, QFile, QObject, QRunnable, Qt, QThread, QThreadPool, QTimer, Signal
-from PySide6.QtGui import QAction, QColor, QIcon, QSyntaxHighlighter, QTextCharFormat
+from PySide6.QtGui import QAction, QColor, QIcon, QKeySequence, QShortcut, QSyntaxHighlighter, QTextCharFormat
 from PySide6.QtUiTools import QUiLoader
 from PySide6.QtWidgets import (
     QApplication,
@@ -48,6 +48,8 @@ from PySide6.QtWidgets import (
     QInputDialog,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMenu,
     QMessageBox,
@@ -503,6 +505,10 @@ class RepoSyncWindow(TrayAwareMixin, L_FramelessMainWindow):
         )
         # 调度每日 0 点自动上传（延迟 5s，避免与启动流程抢占）
         QTimer.singleShot(5000, self._schedule_midnight_auto_upload)
+        # Ctrl+Q 彻底退出（窗口隐藏到托盘后，这是唯一正常退出入口）
+        self._quit_shortcut = QShortcut(QKeySequence("Ctrl+Q"), self)
+        self._quit_shortcut.setContext(Qt.ShortcutContext.ApplicationShortcut)
+        self._quit_shortcut.activated.connect(self._quit_fully)
 
     def _load_style(self):
         qss_path = RESOURCES_DIR / "style.qss"
@@ -510,13 +516,24 @@ class RepoSyncWindow(TrayAwareMixin, L_FramelessMainWindow):
             self.setStyleSheet(qss_path.read_text(encoding="utf-8"))
 
     def closeEvent(self, event):
-        """窗口关闭时清理资源。"""
+        """点 X 关闭 → 隐藏到托盘（进程继续运行每日自动上传等后台任务）。
+
+        托盘再次启动本工具时，会通过 LUGWIT_SHOW_WINDOW 消息唤醒本窗口。
+        彻底退出：Ctrl+Q。
+        """
+        self.save_window_position()
+        self.hide()
+        event.ignore()
+
+    def _quit_fully(self) -> None:
+        """彻底退出进程：先关闭日志文件，再结束 Qt 应用。"""
         if hasattr(self, "_log_file_handler") and self._log_file_handler:
             try:
                 self._log_file_handler.close()
             except Exception:
                 pass
-        super().closeEvent(event)
+            self._log_file_handler = None
+        QtWidgets.QApplication.instance().quit()
 
     def on_tray_message_log(self, message: str) -> None:
         self._log(message)
@@ -2401,7 +2418,7 @@ class RepoSyncWindow(TrayAwareMixin, L_FramelessMainWindow):
                     f"{pkg_name} 无远端独有或双方均改的文件，可直接上传或下载。",
                 )
                 return
-            confirmed, _ = self._confirm_action(
+            confirmed, _, _ = self._confirm_action(
                 "确认 AI 合并",
                 pkg_name,
                 preview_lines,
@@ -4061,7 +4078,9 @@ class RepoSyncWindow(TrayAwareMixin, L_FramelessMainWindow):
         ai_merge_pkg_dir: Path | None = None,
         file_apply_pkg_dir: Path | None = None,
         file_apply_upstream_ref: str | None = None,
-    ) -> tuple[bool, str | None]:
+        enable_file_select: bool = False,
+        file_select_pkg_dir: Path | None = None,
+    ) -> tuple[bool, str | None, list[str] | None]:
         preview = [x for x in lines if x.strip()]
         if not preview:
             preview = [fallback]
@@ -4128,6 +4147,50 @@ class RepoSyncWindow(TrayAwareMixin, L_FramelessMainWindow):
 
         tabs = QTabWidget(dlg)
         tabs.setMinimumHeight(500)
+
+        # ---- 文件选择列表：勾选参与本次同步的文件（上传/下载时启用） ----
+        file_select_list: QListWidget | None = None
+        if enable_file_select:
+            file_choices = self._extract_file_choices(
+                preview, file_select_pkg_dir)
+            if file_choices:
+                sel_tab = QWidget(dlg)
+                sel_lay = QVBoxLayout(sel_tab)
+                sel_lay.setContentsMargins(4, 4, 4, 4)
+                sel_lay.setSpacing(8)
+
+                sel_bar = QHBoxLayout()
+                sel_bar.setSpacing(8)
+                lbl_sel = QLabel(
+                    f"勾选要参与本次同步的文件（共 {len(file_choices)} 个，默认全选）：")
+                lbl_sel.setWordWrap(True)
+                btn_all = QPushButton("全选")
+                btn_none = QPushButton("全不选")
+                sel_bar.addWidget(lbl_sel, 1)
+                sel_bar.addWidget(btn_all)
+                sel_bar.addWidget(btn_none)
+                sel_lay.addLayout(sel_bar)
+
+                file_select_list = QListWidget(dlg)
+                for relpath, status in file_choices:
+                    item = QListWidgetItem(f"[{status}]  {relpath}")
+                    item.setFlags(
+                        item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                    item.setCheckState(Qt.CheckState.Checked)
+                    item.setData(Qt.ItemDataRole.UserRole, relpath)
+                    file_select_list.addItem(item)
+                sel_lay.addWidget(file_select_list, 1)
+
+                def _check_all(checked: bool):
+                    state = (Qt.CheckState.Checked if checked
+                             else Qt.CheckState.Unchecked)
+                    for i in range(file_select_list.count()):
+                        file_select_list.item(i).setCheckState(state)
+
+                btn_all.clicked.connect(lambda _c=False: _check_all(True))
+                btn_none.clicked.connect(lambda _c=False: _check_all(False))
+
+                tabs.addTab(sel_tab, f"选择文件 ({len(file_choices)})")
 
         overview = QTextEdit(dlg)
         overview.setReadOnly(True)
@@ -4505,7 +4568,22 @@ class RepoSyncWindow(TrayAwareMixin, L_FramelessMainWindow):
             txt = (ai_detail_edit.toPlainText() or "").strip()
             if txt:
                 commit_msg_from_ai = txt
-        return accepted, commit_msg_from_ai
+
+        # 收集勾选的文件：全选时返回 None（保持原有全量流程）；
+        # 部分勾选时返回勾选列表；未勾选任何文件返回空列表。
+        selected_files: list[str] | None = None
+        if accepted and file_select_list is not None:
+            checked: list[str] = []
+            all_checked = True
+            for i in range(file_select_list.count()):
+                it = file_select_list.item(i)
+                if it.checkState() == Qt.CheckState.Checked:
+                    checked.append(it.data(Qt.ItemDataRole.UserRole))
+                else:
+                    all_checked = False
+            if not all_checked:
+                selected_files = checked
+        return accepted, commit_msg_from_ai, selected_files
 
     @staticmethod
     def _safe_tab_name(file_name: str, max_len: int = 36) -> str:
@@ -4579,6 +4657,72 @@ class RepoSyncWindow(TrayAwareMixin, L_FramelessMainWindow):
             name = Path(path.replace("\\", "/")).name or path
             blocks.append((name, stripped))
         return blocks[:80]
+
+    def _extract_file_choices(
+        self, lines: list[str], pkg_dir: Path | None
+    ) -> list[tuple[str, str]]:
+        """从预览文本中提取可供勾选的文件列表，返回 [(相对路径, 状态码), ...]。
+
+        只解析预览中的文件清单区域（name-status / 工作区一览 / 将提交的删除），
+        忽略 diff 内容行，避免把代码行误判为文件路径。
+        """
+        file_sections = {
+            "[文件列表: name-status]",
+            "[将推送的文件列表 name-status]",
+            "[本地未提交改动]",
+            "[工作区文件一览 status]",
+            "[将提交的删除]",
+        }
+        choices: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        in_section = False
+        for line in lines:
+            s = (line or "").strip()
+            if not s:
+                in_section = False
+                continue
+            if s.startswith("["):
+                in_section = s in file_sections
+                continue
+            if not in_section or s.startswith("("):
+                continue
+
+            relpath: str | None = None
+            status = ""
+            if "\t" in s:
+                # name-status 行： "M\\trelpath" / "R100\\told -> new"
+                parts = s.split("\t", 1)
+                code = parts[0].strip()
+                path = parts[1].strip() if len(parts) > 1 else ""
+                if code and path and code[0].upper() in "MADRC":
+                    status = code[0].upper()
+                    if " -> " in path:
+                        path = path.split(" -> ", 1)[-1].strip()
+                    relpath = path.strip().strip('"')
+            else:
+                # status + 路径行："M  D:\\abs\\path" 或 "  D relpath"
+                parts = s.split(maxsplit=1)
+                if len(parts) == 2 and parts[0] and len(parts[0]) <= 2 and all(
+                    c in "MADRC?U" for c in parts[0]
+                ):
+                    status = parts[0][0].upper()
+                    path = parts[1].strip().strip('"')
+                    if " -> " in path:
+                        path = path.split(" -> ", 1)[-1].strip()
+                    if os.path.isabs(path) and pkg_dir is not None:
+                        try:
+                            path = os.path.relpath(path, str(pkg_dir))
+                        except ValueError:
+                            continue
+                    relpath = path
+            if not relpath:
+                continue
+            relpath = relpath.replace("\\", "/")
+            if relpath in seen or relpath in (".", "") or relpath.startswith("../"):
+                continue
+            seen.add(relpath)
+            choices.append((relpath, status))
+        return choices
 
     @staticmethod
     def _apply_diff_highlight(editor: QTextEdit):
@@ -5112,12 +5256,14 @@ class RepoSyncWindow(TrayAwareMixin, L_FramelessMainWindow):
             self._ensure_gitignore(pkg_dir)
             self._ensure_remote(pkg_dir, pkg_name, owner)
             upload_preview = self._preview_upload_files(pkg_dir)
-            confirmed, ai_commit_message = self._confirm_action(
+            confirmed, ai_commit_message, selected_files = self._confirm_action(
                 "确认上传",
                 pkg_name,
                 upload_preview,
                 "无文件变化（可能仅推送远端分支状态）",
                 enable_ai=True,
+                enable_file_select=True,
+                file_select_pkg_dir=pkg_dir,
             )
             if not confirmed:
                 self._log(f"[info] {pkg_name} 取消上传")
@@ -5137,7 +5283,22 @@ class RepoSyncWindow(TrayAwareMixin, L_FramelessMainWindow):
                     f"[info] {pkg_name} 将提交 {len(pending_deletions)} 个文件删除: {sample}"
                 )
 
-            self._run(["git", "add", "-A"], cwd=pkg_dir)
+            if selected_files is None:
+                # 全选：保持原有全量暂存
+                self._run(["git", "add", "-A"], cwd=pkg_dir)
+            else:
+                if not selected_files:
+                    self._log(f"[info] {pkg_name} 未勾选任何文件，取消上传")
+                    return
+                self._log(
+                    f"[info] {pkg_name} 仅上传勾选的 {len(selected_files)} 个文件")
+                # 清空暂存区（不影响工作区文件），确保只提交勾选的文件
+                self._run(["git", "reset", "-q", "HEAD"], cwd=pkg_dir)
+                for i in range(0, len(selected_files), 50):
+                    self._run(
+                        ["git", "add", "--", *selected_files[i:i + 50]],
+                        cwd=pkg_dir,
+                    )
             ok, _ = self._run(
                 ["git", "diff", "--cached", "--quiet"], cwd=pkg_dir)
             if not ok:
@@ -5318,7 +5479,7 @@ class RepoSyncWindow(TrayAwareMixin, L_FramelessMainWindow):
             )
             upstream_ref = upstream.strip().splitlines(
             )[-1] if ok_up and upstream and upstream.strip() else ""
-            confirmed, _ = self._confirm_action(
+            confirmed, _, selected_files = self._confirm_action(
                 "确认下载",
                 pkg_name,
                 download_preview,
@@ -5326,9 +5487,44 @@ class RepoSyncWindow(TrayAwareMixin, L_FramelessMainWindow):
                 enable_ai=False,
                 file_apply_pkg_dir=pkg_dir,
                 file_apply_upstream_ref=upstream_ref,
+                enable_file_select=True,
+                file_select_pkg_dir=pkg_dir,
             )
             if not confirmed:
                 self._log(f"[info] {pkg_name} 取消下载")
+                return
+            if selected_files is not None:
+                # 部分选择：fetch 后仅 checkout 勾选的文件
+                if not selected_files:
+                    self._log(f"[info] {pkg_name} 未勾选任何文件，取消下载")
+                    return
+                self._log(
+                    f"[info] {pkg_name} 仅下载勾选的 {len(selected_files)} 个文件")
+                ok_fetch, msg_fetch = self._run(
+                    ["git", "fetch", "--all", "--prune"], cwd=pkg_dir)
+                if not ok_fetch:
+                    self._log(f"[ERR] {pkg_name} fetch 失败: {msg_fetch}")
+                    QMessageBox.warning(
+                        self, "下载失败", f"{pkg_name} fetch 失败:\n{msg_fetch}")
+                    return
+                target = upstream_ref or f"origin/{self._current_branch(pkg_dir)}"
+                failed_count = 0
+                for i in range(0, len(selected_files), 50):
+                    ok, msg = self._run(
+                        ["git", "checkout", target, "--",
+                         *selected_files[i:i + 50]],
+                        cwd=pkg_dir,
+                    )
+                    if not ok:
+                        failed_count += 1
+                        self._log(f"[WARN] {pkg_name} checkout 失败: {msg}")
+                if failed_count:
+                    QMessageBox.warning(
+                        self, "部分下载失败",
+                        f"{pkg_name} 有 {failed_count} 批文件下载失败，详见日志。")
+                else:
+                    self._log(
+                        f"[ok] {pkg_name} 已下载勾选的 {len(selected_files)} 个文件")
                 return
             ok_pull, msg_pull = self._run(
                 ["git", "pull", "--ff-only"], cwd=pkg_dir)
