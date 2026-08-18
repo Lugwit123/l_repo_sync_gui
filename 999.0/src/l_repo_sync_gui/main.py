@@ -4570,6 +4570,28 @@ class RepoSyncWindow(TrayAwareMixin, L_FramelessMainWindow):
         layout.addWidget(main_content_splitter, 1)
 
         btn_row = QHBoxLayout()
+        # 上传/下载确认框：提供「合并」按钮，触发限制性 git 合并 + AI 合并
+        # （AI 合并结果需人工审查后再写入本地）。仅在上传/下载上下文（有 pkg_dir）
+        # 且非「AI 合并预览」自身弹出的确认框时显示。
+        merge_pkg_dir = file_select_pkg_dir or file_apply_pkg_dir
+        trigger_merge = {"do": False}
+        if merge_pkg_dir is not None and ai_merge_plan is None:
+            btn_merge = QPushButton("合并")
+            _merge_sync = self.package_sync_map.get(merge_pkg_dir.name, {})
+            if self._is_diverged(_merge_sync):
+                btn_merge.setToolTip(
+                    "限制性 git 合并 + AI 合并；AI 合并结果需人工审查后再写入本地。")
+            else:
+                btn_merge.setEnabled(False)
+                btn_merge.setToolTip(
+                    "仅当本地与远端分叉（双方均有提交）时可合并。")
+
+            def _on_merge_clicked():
+                trigger_merge["do"] = True
+                dlg.reject()
+
+            btn_merge.clicked.connect(_on_merge_clicked)
+            btn_row.addWidget(btn_merge)
         btn_row.addStretch()
         btn_yes = QPushButton("Yes")
         btn_no = QPushButton("No")
@@ -4582,6 +4604,11 @@ class RepoSyncWindow(TrayAwareMixin, L_FramelessMainWindow):
         list_scroll = self._list_scroll_pos()
         accepted = dlg.exec() == QDialog.Accepted
         self._restore_list_scroll(list_scroll)
+        # 用户点「合并」：当前上传/下载确认框已 reject（accepted=False，上传/下载
+        # 流程随即取消返回），在事件循环空闲时启动 AI 合并流程，避免嵌套弹窗。
+        if trigger_merge["do"] and merge_pkg_dir is not None:
+            QTimer.singleShot(
+                0, lambda d=merge_pkg_dir: self.merge_one_ai(d))
         commit_msg_from_ai = None
         if (
             accepted
