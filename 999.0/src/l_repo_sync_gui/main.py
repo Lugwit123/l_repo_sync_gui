@@ -709,7 +709,19 @@ class RepoSyncWindow(TrayAwareMixin, L_FramelessMainWindow):
         dlg.exec()
 
     def _github_token(self) -> str:
-        return (self.gh_token_edit.text() or "").strip()
+        """获取 GitHub Token：优先 UI 控件（可能是刚输入、尚未保存的值），
+        控件为空时回退读取本地 token 文件。"""
+        token = (self.gh_token_edit.text() or "").strip()
+        if token:
+            return token
+        try:
+            if AUTH_CONFIG_FILE.exists():
+                data = json.loads(
+                    AUTH_CONFIG_FILE.read_text(encoding="utf-8"))
+                return str(data.get("github_token") or "").strip()
+        except Exception:
+            pass
+        return ""
 
     def _load_auth_settings(self):
         """加载本地 GitHub token 配置。"""
@@ -1891,16 +1903,27 @@ class RepoSyncWindow(TrayAwareMixin, L_FramelessMainWindow):
         except ValueError:
             return False
 
-    def _fetch_remote_repo_names(self, owner: str) -> tuple[bool, list[str], str]:
-        """列出 GitHub owner 下全部仓库名。"""
-        return github_helper.list_repo_names(owner, self._github_token())
+    def _fetch_remote_repo_names(
+        self, owner: str, token: str | None = None
+    ) -> tuple[bool, list[str], str]:
+        """列出 GitHub owner 下全部仓库名。
 
-    def _fetch_remote_repo_names_quiet(self, owner: str) -> tuple[bool, list[str], str]:
-        return github_helper.list_repo_names(owner, self._github_token())
+        token 默认从 UI 控件读取（仅主线程可调用）；
+        后台线程调用时必须显式传入 token，避免跨线程访问 Qt 控件。
+        """
+        if token is None:
+            token = self._github_token()
+        return github_helper.list_repo_names(owner, token)
+
+    def _fetch_remote_repo_names_quiet(
+        self, owner: str, token: str | None = None
+    ) -> tuple[bool, list[str], str]:
+        return self._fetch_remote_repo_names(owner, token)
 
     def _collect_full_package_data(
         self,
         owner: str,
+        token: str | None = None,
         on_entry_ready=None,
     ) -> tuple[list[tuple[str, Path, bool]], dict, list[str]]:
         """后台收集包列表与 git 状态。"""
@@ -1912,7 +1935,7 @@ class RepoSyncWindow(TrayAwareMixin, L_FramelessMainWindow):
         ]
 
         self._package_refresh_bridge.log.emit("获取远端仓库列表…")
-        ok, remote_names, err = self._fetch_remote_repo_names_quiet(owner)
+        ok, remote_names, err = self._fetch_remote_repo_names_quiet(owner, token)
         if ok:
             self._package_refresh_bridge.log.emit(
                 f"远端仓库数: {len(remote_names)}")
@@ -1920,7 +1943,7 @@ class RepoSyncWindow(TrayAwareMixin, L_FramelessMainWindow):
                 if name in local_names or name in SKIP_DIRS:
                     continue
                 entries.append((name, self._remote_package_path(name), True))
-        elif self._github_token():
+        else:
             warnings.append(f"[WARN] 获取远端仓库列表失败，仅显示本地包: {err}")
 
         return entries, {}, warnings
@@ -1939,7 +1962,7 @@ class RepoSyncWindow(TrayAwareMixin, L_FramelessMainWindow):
                 if name in local_names or name in SKIP_DIRS:
                     continue
                 entries.append((name, self._remote_package_path(name), True))
-        elif self._github_token():
+        else:
             self._log(f"[WARN] 获取远端仓库列表失败，仅显示本地包: {err}")
 
         return entries
@@ -3026,6 +3049,8 @@ class RepoSyncWindow(TrayAwareMixin, L_FramelessMainWindow):
                          for name, path in self._local_package_entries()]
         self._render_package_list(local_entries, {}, loading=True)
         owner = self.owner_edit.text().strip() or "Lugwit123"
+        # token 必须在主线程读取；worker 在后台线程运行，跨线程访问 Qt 控件不可靠
+        gh_token = self._github_token()
         self._log_phase_start("加载包列表")
 
         def _worker():
@@ -3038,7 +3063,7 @@ class RepoSyncWindow(TrayAwareMixin, L_FramelessMainWindow):
                 if scan_status:
                     self._package_refresh_bridge.log.emit("获取远端仓库列表…")
                     ok, remote_names, err = self._fetch_remote_repo_names_quiet(
-                        owner)
+                        owner, gh_token)
                     if ok:
                         self._package_refresh_bridge.log.emit(
                             f"远端仓库数: {len(remote_names)}")
@@ -3047,7 +3072,7 @@ class RepoSyncWindow(TrayAwareMixin, L_FramelessMainWindow):
                                 continue
                             entries.append(
                                 (name, self._remote_package_path(name), True))
-                    elif self._github_token():
+                    else:
                         self._package_refresh_bridge.log.emit(
                             f"[WARN] 获取远端仓库列表失败，仅显示本地包: {err}")
 
