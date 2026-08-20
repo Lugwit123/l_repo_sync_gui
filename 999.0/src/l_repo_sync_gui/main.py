@@ -3222,9 +3222,10 @@ class RepoSyncWindow(TrayAwareMixin, L_FramelessMainWindow):
 
     def _copy_package_launch_cmd(self, pkg_name: str, alias_name: str, alias_command: str):
         cmd = self._format_rez_launch_cmd(pkg_name, alias_name)
-        copy_text = f"{cmd}  # {{{alias_command}}}"
+        # 剪贴板只放可执行命令；注释仅保留在日志中，避免粘贴到命令行后无法运行
+        copy_text = cmd
         QApplication.clipboard().setText(copy_text)
-        self._log(f"[copy] {copy_text}")
+        self._log(f"[copy] {copy_text}  # {{{alias_command}}}")
 
     def _build_clean_env(self) -> dict:
         """清理 rez 脏环境变量，避免传递给子进程时污染。"""
@@ -3380,8 +3381,9 @@ class RepoSyncWindow(TrayAwareMixin, L_FramelessMainWindow):
             )
             menu.addAction(launch_action)
 
-            copy_action = QAction(f"复制: {menu_text}", self)
-            copy_action.setToolTip(menu_text)
+            # 「复制」项只显示/复制纯命令，不带注释性代码
+            copy_action = QAction(f"复制: {launch_cmd}", self)
+            copy_action.setToolTip(launch_cmd)
             copy_action.triggered.connect(
                 lambda _=False, p=pkg_name, a=alias_name, c=alias_command: self._copy_package_launch_cmd(
                     p, a, c)
