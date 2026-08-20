@@ -315,10 +315,20 @@ def format_rez_alias_launch_cmd(
     alias_name: str,
     *,
     wuwo_bat: Path | None = None,
+    shell: str = "ps",
+    solo: bool = True,
 ) -> str:
-    if wuwo_bat is not None:
-        return f"wuwor {pkg_name} .ps .solo -- {alias_name}"
-    return f"wuwo {pkg_name} .ps .solo -- {alias_name}"
+    # shell 对应工具栏单选组：none(不带窗口修饰符) / cmd / ps；solo 追加 .solo 单实例修饰符
+    launcher = "wuwor" if wuwo_bat is not None else "wuwo"
+    modifiers = []
+    if shell == "ps":
+        modifiers.append(".ps")
+    elif shell == "cmd":
+        modifiers.append(".cmd")
+    if solo:
+        modifiers.append(".solo")
+    mod_text = f" {' '.join(modifiers)}" if modifiers else ""
+    return f"{launcher} {pkg_name}{mod_text} -- {alias_name}"
 
 
 class _AiBridge(QObject):
@@ -3213,11 +3223,29 @@ class RepoSyncWindow(TrayAwareMixin, L_FramelessMainWindow):
         self._log(f"[alias] {pkg_name}: 最终别名数={len(aliases)}")
         return aliases
 
+    def _current_run_options(self) -> tuple[str, bool, bool]:
+        """统一读取顶部工具栏启动选项，返回 (run_mode, solo, debug)。
+
+        run_mode 来自 run_buttonGroup 单选组（none/cmd/ps），
+        保证右键菜单显示、复制与实际启动三处使用同一份状态。
+        """
+        run_mode = "none"
+        if self.run_buttonGroup:
+            checked = self.run_buttonGroup.checkedButton()
+            if checked:
+                run_mode = checked.text().lower()
+        solo = bool(self.solo_checkBox and self.solo_checkBox.isChecked())
+        debug = bool(self.debug_start_pkg and self.debug_start_pkg.isChecked())
+        return run_mode, solo, debug
+
     def _format_rez_launch_cmd(self, pkg_name: str, alias_name: str) -> str:
+        run_mode, solo, _debug = self._current_run_options()
         return format_rez_alias_launch_cmd(
             pkg_name,
             alias_name,
             wuwo_bat=self._wuwo_bat_path(),
+            shell=run_mode,
+            solo=solo,
         )
 
     def _copy_package_launch_cmd(self, pkg_name: str, alias_name: str, alias_command: str):
@@ -3248,24 +3276,17 @@ class RepoSyncWindow(TrayAwareMixin, L_FramelessMainWindow):
         if wuwo_bat is None:
             QMessageBox.warning(self, "启动失败", "未找到 wuwo.bat，无法启动。")
             return
+        run_mode, solo_on, debug = self._current_run_options()
         cmd_text = self._format_rez_launch_cmd(pkg_name, alias_name)
         self._log(f"[launch] {cmd_text}  # {{{alias_command}}}")
         clean_env = self._build_clean_env()
-
-        # 读取 run_buttonGroup 选择：none / cmd / ps
-        run_mode = "none"
-        if self.run_buttonGroup:
-            checked = self.run_buttonGroup.checkedButton()
-            if checked:
-                run_mode = checked.text().lower()
         self._log(f"[run_mode] {run_mode}")
 
         try:
             # wuwor.bat 是同目录下的转发器，和托盘 Tray.py 完全一致的启动方式
             wuwo_dir = str(wuwo_bat.parent)
             wuwor_bat = os.path.join(wuwo_dir, "wuwor.bat")
-            solo = " .solo" if (
-                self.solo_checkBox and self.solo_checkBox.isChecked()) else ""
+            solo = " .solo" if solo_on else ""
             if sys.platform == "win32":
                 if run_mode == "none":
                     # 当前进程运行，不打开新窗口
@@ -3278,7 +3299,6 @@ class RepoSyncWindow(TrayAwareMixin, L_FramelessMainWindow):
                     final_cmd = f'cmd.exe /c "{wuwor_bat}" {pkg_name} .cmd{solo} -- {alias_name}'
                 self._log(f"[exec] {final_cmd}")
                 self._log(f"[启动包时间] {datetime.datetime.now()}")
-                debug = self.debug_start_pkg.isChecked() if self.debug_start_pkg else False
                 if debug:
                     # debug 模式：当前进程运行，不创建新控制台
                     subprocess.Popen(
@@ -3370,9 +3390,11 @@ class RepoSyncWindow(TrayAwareMixin, L_FramelessMainWindow):
             menu.exec(global_pos)
             return
 
+        _run_mode, _solo_on, debug_on = self._current_run_options()
+        dbg_mark = " [debug]" if debug_on else ""
         for alias_name, alias_command in aliases:
             launch_cmd = self._format_rez_launch_cmd(pkg_name, alias_name)
-            menu_text = f"{launch_cmd}  # {{{alias_command}}}"
+            menu_text = f"{launch_cmd}  # {{{alias_command}}}{dbg_mark}"
             launch_action = QAction(f"启动: {menu_text}", self)
             launch_action.setToolTip(menu_text)
             launch_action.triggered.connect(
